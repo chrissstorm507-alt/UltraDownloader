@@ -1,336 +1,932 @@
-"""
-Ultra Video Downloader Pro  (Flet + yt-dlp)
-Run:  python main.py
+# =====================================================================
+#  Ultra Downloader Pro  v3.0   (Flet + yt-dlp)
+#  नियम / RULE: कोई भी "video" विकल्प आवाज़ के बिना नहीं बनता।
+#               Every "video" choice is audio-guaranteed by construction.
+#  चलाएँ / Run   :  python main.py
+#  जाँच / Verify :  python main.py --selftest
+# =====================================================================
+from __future__ import annotations
 
-Layout rules used in this file (to avoid the grey / white screen):
-  * No Row(wrap=True)  -> buttons are laid out by explicit widths computed in Python.
-  * No expand=... inside nested containers -> every width is explicit and bounded.
-  * The card width is recalculated on every window resize (phone / tablet / PC).
-"""
+import asyncio
 import glob
-import inspect
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
 
 import flet as ft
 import yt_dlp
 
+APP_NAME = "Ultra Downloader Pro"
+APP_VER = "3.0.0"
 
-# ======================================================================
-# Helpers (pure functions - easy to test)
-# ======================================================================
-class DownloadCancelledError(Exception):
+IS_ANDROID = hasattr(sys, "getandroidapilevel") or os.path.exists("/system/build.prop")
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+OK, WARN, ERR, INFO = "#22C55E", "#F59E0B", "#EF4444", "#3B82F6"
+
+PAL = {
+    True: dict(page="#0B0F19", card="#131C2E", panel="#1E293B", item="#0F172A",
+               text="#E2E8F0", muted="#94A3B8", accent="#60A5FA", line="#334155"),
+    False: dict(page="#F1F5F9", card="#FFFFFF", panel="#E2E8F0", item="#F8FAFC",
+                text="#0F172A", muted="#475569", accent="#1D4ED8", line="#CBD5E1"),
+}
+
+
+# =====================================================================
+#  भाग 1 / PART 1 — शुद्ध फंक्शन (आसानी से टेस्ट होते हैं)
+#                 Pure helpers (unit-testable, no UI, no network)
+# =====================================================================
+def clean_ansi(t: Any) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", str(t or "")).strip()
+
+
+def human_size(n, unknown="साइज़ अज्ञात"):
+    try:
+        n = float(n or 0)
+    except Exception:
+        return unknown
+    if n <= 0:
+        return unknown
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.2f} TB"
+
+
+def human_dur(s):
+    if not s:
+        return "—"
+    s = int(s)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def normalize_url(t: str) -> str:
+    """स्कीम के बिना लिंक भी स्वीकार / Accept scheme-less links too."""
+    t = (t or "").strip().strip('"').strip("'")
+    if not t:
+        return ""
+    if re.match(r"^https?://", t, re.I):
+        return t
+    if re.match(r"^[\w-]+(\.[\w-]+)+/\S*$", t):
+        return "https://" + t
+    return t
+
+
+def is_url(t: str) -> bool:
+    t = normalize_url(t)
+    return bool(re.match(r"^https?://[\w-]+(\.[\w-]+)+\S*$", t, re.I))
+
+
+def quality_tag(h: int) -> str:
+    h = int(h or 0)
+    if h >= 4320: return f"8K UHD ({h}p)"
+    if h >= 2160: return f"4K Ultra HD ({h}p)"
+    if h >= 1440: return f"2K QHD ({h}p)"
+    if h >= 1080: return "1080p Full HD"
+    if h >= 720:  return "720p HD"
+    if h >= 480:  return "480p"
+    if h >= 360:  return "360p"
+    return f"{h}p डेटा सेवर"
+
+
+def friendly_error(ex) -> str:
+    m = clean_ansi(str(ex))
+    low = m.lower()
+    table = [
+        (("sign in to confirm", "not a bot"),
+         "YouTube ने bot-जाँच माँगी। कुछ देर रुकें, दूसरा नेटवर्क लें, या Settings में cookies फाइल दें।"),
+        (("private video",), "यह वीडियो Private है — डाउनलोड संभव नहीं।"),
+        (("video unavailable", "has been removed"), "वीडियो उपलब्ध नहीं / हटा दिया गया है।"),
+        (("unsupported url",), "यह लिंक समर्थित नहीं है। सही वीडियो लिंक डालें।"),
+        (("requested format is not available",),
+         "चुनी गई क्वालिटी इस वीडियो में नहीं है। दोबारा Scan करके दूसरी क्वालिटी चुनें।"),
+        (("ffmpeg is not installed", "ffmpeg not found", "won't be merged"),
+         "FFmpeg नहीं मिला — मर्ज नहीं हुआ। Settings में FFmpeg पाथ दें या APK में FFmpeg बाँधें।"),
+        (("http error 403", "forbidden"), "सर्वर ने रोका (403)। yt-dlp अपडेट करें: pip install -U yt-dlp"),
+        (("http error 429", "too many requests"), "बहुत ज़्यादा अनुरोध (429)। Turbo कम करें, थोड़ी देर रुकें।"),
+        (("permission denied",), "फोल्डर की अनुमति नहीं। दूसरा सेव फोल्डर चुनें।"),
+        (("no space left",), "स्टोरेज भर गया है। जगह खाली करें।"),
+        (("urlopen error", "getaddrinfo", "timed out", "connection reset"),
+         "इंटरनेट/नेटवर्क समस्या। कनेक्शन जाँचकर फिर कोशिश करें।"),
+        (("copyright",), "कॉपीराइट ब्लॉक के कारण यह वीडियो उपलब्ध नहीं।"),
+        (("geo",), "यह वीडियो आपके देश में ब्लॉक है (geo-block)।"),
+    ]
+    for keys, msg in table:
+        if any(k in low for k in keys):
+            return msg
+    return m[:160] or "अज्ञात त्रुटि"
+
+
+# =====================================================================
+#  भाग 2 / PART 2 — FFmpeg खोज (Android सहित)
+#                 FFmpeg discovery (Android included)
+# =====================================================================
+@dataclass
+class FF:
+    exe: Optional[str] = None
+    probe: Optional[str] = None
+    source: str = "नहीं मिला / not found"
+    version: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.exe)
+
+    @property
+    def folder(self) -> Optional[str]:
+        return os.path.dirname(self.exe) if self.exe else None
+
+
+def _exe_version(path: str) -> str:
+    """असल में चलाकर देखो — केवल फाइल देखना काफ़ी नहीं / Actually exec it."""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        if not IS_WIN:
+            try:
+                os.chmod(path, 0o755)
+            except Exception:
+                pass
+        r = subprocess.run([path, "-version"], capture_output=True, timeout=10, text=True)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.splitlines()[0][:90]
+    except Exception:
+        pass
+    return ""
+
+
+def _android_native_dirs() -> List[str]:
+    """
+    Android 10+ ऐप के data dir से exec() बंद है, पर nativeLibraryDir खुला है।
+    /proc/self/maps से libflutter.so का फोल्डर निकालकर वहीँ libffmpeg.so देखो।
+    Android 10+ blocks exec() from app data dir, but nativeLibraryDir is allowed.
+    Derive it from /proc/self/maps (libflutter.so) and look for libffmpeg.so.
+    """
+    out = set()
+    try:
+        with open("/proc/self/maps", "r") as fh:
+            for line in fh:
+                if "/lib/" in line and line.rstrip().endswith(".so"):
+                    p = line.split()[-1]
+                    if os.path.isfile(p):
+                        out.add(os.path.dirname(p))
+    except Exception:
+        pass
+    return sorted(out)
+
+
+def discover_ffmpeg(custom: str = "") -> FF:
+    cands: List[tuple] = []
+    if custom:
+        cands.append((custom, "कस्टम पाथ / custom path"))
+    env = os.environ.get("ULTRA_FFMPEG") or os.environ.get("FFMPEG_BINARY")
+    if env:
+        cands.append((env, "env"))
+    w = shutil.which("ffmpeg")
+    if w:
+        cands.append((w, "PATH"))
+    try:
+        import imageio_ffmpeg  # वैकल्पिक / optional
+        cands.append((imageio_ffmpeg.get_ffmpeg_exe(), "imageio-ffmpeg"))
+    except Exception:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in _android_native_dirs():
+        cands.append((os.path.join(d, "libffmpeg.so"), "APK jniLibs"))
+        cands.append((os.path.join(d, "libffprobe.so"), "APK jniLibs"))
+    data = os.environ.get("FLET_APP_STORAGE_DATA") or ""
+    if data:
+        cands.append((os.path.join(data, "ffmpeg", "ffmpeg"), "app storage"))
+    for p in (os.path.join(here, "ffmpeg.exe" if IS_WIN else "ffmpeg"),
+              os.path.join(here, "bin", "ffmpeg.exe" if IS_WIN else "ffmpeg"),
+              "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg",
+              r"C:\ffmpeg\bin\ffmpeg.exe"):
+        cands.append((p, "सामान्य पाथ / common path"))
+
+    for path, src in cands:
+        if not path or path.endswith("libffprobe.so"):
+            continue
+        ver = _exe_version(path)
+        if ver:
+            probe = None
+            sib = os.path.join(os.path.dirname(path),
+                               "ffprobe.exe" if IS_WIN else
+                               ("libffprobe.so" if path.endswith(".so") else "ffprobe"))
+            if os.path.isfile(sib):
+                probe = sib
+            elif shutil.which("ffprobe"):
+                probe = shutil.which("ffprobe")
+            return FF(exe=path, probe=probe, source=src, version=ver)
+    return FF()
+
+
+# =====================================================================
+#  भाग 3 / PART 3 — फाइल में आवाज़ है? (शुद्ध Python सत्यापन)
+#                 Does the file really contain audio? (pure Python)
+# =====================================================================
+def _boxes(fh, end: int):
+    while True:
+        pos = fh.tell()
+        if pos + 8 > end:
+            return
+        head = fh.read(8)
+        if len(head) < 8:
+            return
+        size = struct.unpack(">I", head[:4])[0]
+        typ = head[4:8]
+        hdr = 8
+        if size == 1:
+            ext = fh.read(8)
+            if len(ext) < 8:
+                return
+            size = struct.unpack(">Q", ext)[0]
+            hdr = 16
+        elif size == 0:
+            size = end - pos
+        if size < hdr or pos + size > end:
+            return
+        yield typ, pos + hdr, pos + size
+        fh.seek(pos + size)
+
+
+def _find_soun(fh, start: int, end: int, depth: int = 0) -> bool:
+    if depth > 6:
+        return False
+    fh.seek(start)
+    for typ, s, e in _boxes(fh, end):
+        if typ in (b"moov", b"trak", b"mdia"):
+            if _find_soun(fh, s, e, depth + 1):
+                return True
+        elif typ == b"hdlr":
+            fh.seek(s)
+            data = fh.read(min(24, e - s))
+            if len(data) >= 12 and data[8:12] == b"soun":
+                return True
+    return False
+
+
+def probe_audio(path: str):
+    """True = आवाज़ है, False = नहीं है, None = पता नहीं (TS आदि)।"""
+    try:
+        size = os.path.getsize(path)
+        if size < 512:
+            return None
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+            if head[4:8] in (b"ftyp", b"moov", b"mdat", b"free", b"skip"):
+                return _find_soun(fh, 0, size)
+            if head[:4] == b"\x1a\x45\xdf\xa3":          # Matroska / WebM
+                fh.seek(0)
+                blob = fh.read(min(size, 4 * 1024 * 1024))
+                return b"\x83\x81\x02" in blob            # TrackType = audio
+            if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+                return True                               # MP3 / ADTS-AAC
+            fh.seek(0)
+            ts = fh.read(188 * 3)
+            if len(ts) >= 188 and ts[0] == 0x47 and (len(ts) < 376 or ts[188] == 0x47):
+                return None                               # MPEG-TS: अपुष्ट
+    except Exception:
+        return None
+    return None
+
+
+# =====================================================================
+#  भाग 4 / PART 4 — क्वालिटी इंजन (आवाज़ की गारंटी यहीं बनती है)
+#                 Quality engine (audio guarantee is built here)
+# =====================================================================
+@dataclass
+class Choice:
+    key: str
+    kind: str                    # "video" | "audio"
+    title: str
+    meta: str
+    size: int
+    fmt: str
+    height: int = 0
+    container: str = "mp4"
+    needs_ffmpeg: bool = False
+    available: bool = True
+    reason: str = ""
+    experimental: bool = False
+    pp: Optional[list] = None
+
+
+def _vc(f): return f.get("vcodec") or "none"
+def _ac(f): return f.get("acodec") or "none"
+
+
+def _fsize(f, dur):
+    sz = f.get("filesize") or f.get("filesize_approx")
+    if not sz and dur:
+        br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0))
+        if br:
+            sz = int(br * 1000 / 8 * dur)
+    return int(sz or 0)
+
+
+def pick_container(vcodec: str, acodec: str, pref: str) -> str:
+    if pref == "mp4":
+        return "mp4"
+    if pref == "mkv":
+        return "mkv"
+    if vcodec.startswith("avc1") and acodec.startswith("mp4a"):
+        return "mp4"
+    if vcodec.startswith(("vp9", "vp09")) and acodec.startswith("opus"):
+        return "webm"
+    return "mkv"
+
+
+def _codec_rank(vcodec: str, h: int, mode: str) -> int:
+    if mode == "quality":
+        return 0
+    if h <= 1080:
+        return {"avc1": 3}.get(vcodec[:4], 2 if vcodec.startswith(("vp9", "vp09")) else 1)
+    return 3 if vcodec.startswith(("vp9", "vp09")) else (2 if vcodec.startswith("av01") else 1)
+
+
+def build_choices(info: dict, ff_ok: bool, prefs: dict):
+    """
+    returns (choices, blocked_heights)
+    नियम: kind == "video" और available == True  =>  आवाज़ पक्की।
+    RULE: kind == "video" and available == True  =>  audio guaranteed.
+    """
+    dur = info.get("duration") or 0
+    formats = info.get("formats") or []
+    mode = prefs.get("codec", "compat")
+    cpref = prefs.get("container", "mp4")
+
+    prog, vonly, aonly, hls = [], [], [], []
+    for f in formats:
+        v, a = _vc(f), _ac(f)
+        if v != "none" and a != "none":
+            prog.append(f)
+            if str(f.get("protocol", "")).startswith("m3u8"):
+                hls.append(f)
+        elif v != "none":
+            vonly.append(f)
+        elif a != "none":
+            aonly.append(f)
+
+    aonly.sort(key=lambda f: (f.get("abr") or 0, _fsize(f, dur)), reverse=True)
+    aac = [f for f in aonly
+           if f.get("ext") in ("m4a", "mp4") or str(f.get("acodec", "")).startswith("mp4a")]
+    merge_a = (aac[0] if aac else (aonly[0] if aonly else None)) if mode == "compat" \
+        else (aonly[0] if aonly else None)
+
+    def group(lst, rank_fn):
+        g = {}
+        for f in lst:
+            h = int(f.get("height") or 0)
+            if not h:
+                continue
+            r = rank_fn(f, h)
+            if h not in g or r > g[h][0]:
+                g[h] = (r, f)
+        return {h: v[1] for h, v in g.items()}
+
+    gv = group(vonly, lambda f, h: (_codec_rank(_vc(f), h, mode),
+                                    f.get("fps") or 0, f.get("tbr") or 0, _fsize(f, dur)))
+    gp = group(prog, lambda f, h: (1 if f.get("ext") == "mp4" else 0,
+                                   f.get("tbr") or 0, _fsize(f, dur)))
+    gh = group(hls, lambda f, h: (f.get("tbr") or 0, _fsize(f, dur)))
+
+    choices: List[Choice] = []
+    blocked: List[int] = []
+
+    for h in sorted(set(gv) | set(gp) | set(gh), reverse=True):
+        vo, pr, hl = gv.get(h), gp.get(h), gh.get(h)
+        tag = quality_tag(h)
+        made = False
+
+        if ff_ok and vo and merge_a:
+            cont = pick_container(_vc(vo), _ac(merge_a), cpref)
+            fps = int(vo.get("fps") or 0)
+            total = _fsize(vo, dur) + _fsize(merge_a, dur)
+            choices.append(Choice(
+                key=f"v{h}m", kind="video",
+                title=f"🎬 {tag}" + (f" • {fps}fps" if fps > 30 else "") + " • 🔊 आवाज़ पक्की",
+                meta=f"{human_size(total)} • {cont.upper()} • "
+                     f"{_vc(vo)[:4]}+{_ac(merge_a)[:4]} • मर्ज (FFmpeg)",
+                size=total, height=h, container=cont, needs_ffmpeg=True,
+                fmt=(f"{vo['format_id']}+{merge_a['format_id']}/"
+                     f"bestvideo[height<={h}]+bestaudio/best[height<={h}]")))
+            made = True
+
+        if pr:
+            fps = int(pr.get("fps") or 0)
+            choices.append(Choice(
+                key=f"v{h}d", kind="video",
+                title=f"🎬 {tag}" + (f" • {fps}fps" if fps > 30 else "") + " • 🔊 एक ही फाइल",
+                meta=f"{human_size(_fsize(pr, dur))} • {str(pr.get('ext','mp4')).upper()} • "
+                     f"Direct (FFmpeg की ज़रूरत नहीं)",
+                size=_fsize(pr, dur), height=h,
+                container=str(pr.get("ext", "mp4")),
+                fmt=f"{pr['format_id']}/best[height<={h}][acodec!=none]/best"))
+            made = True
+
+        if hl and not made and prefs.get("hls", True):
+            choices.append(Choice(
+                key=f"v{h}h", kind="video",
+                title=f"🎬 {tag} • 🔊 HLS (प्रयोगात्मक)",
+                meta=f"{human_size(_fsize(hl, dur))} • TS→MP4 • FFmpeg के बिना HD का रास्ता",
+                size=_fsize(hl, dur), height=h, container="mp4",
+                experimental=True,
+                fmt=f"{hl['format_id']}/best[height<={h}][protocol*=m3u8]/best"))
+            made = True
+
+        if not made:
+            blocked.append(h)
+            choices.append(Choice(
+                key=f"lock{h}", kind="video",
+                title=f"🔒 {tag} • आवाज़ के साथ उपलब्ध नहीं",
+                meta="FFmpeg इंस्टॉल/बाँधें — तब यह क्वालिटी आवाज़ सहित मिलेगी",
+                size=(_fsize(vo, dur) + (_fsize(merge_a, dur) if merge_a else 0)) if vo else 0,
+                height=h, available=False, reason="FFmpeg चाहिए"))
+
+    # ---- Auto Best / ऑटो सर्वोत्तम ----
+    vids = [c for c in choices if c.kind == "video" and c.available]
+    if vids:
+        if ff_ok:
+            afmt = "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+            acont = "mp4" if cpref == "mp4" else ("mkv" if cpref == "mkv" else "mkv")
+            ameta = "सबसे ऊँची उपलब्ध क्वालिटी • आवाज़ मर्ज होगी"
+        else:
+            afmt = "best[acodec!=none]/best"
+            acont = "mp4"
+            ameta = "सबसे ऊँची combined क्वालिटी • FFmpeg नहीं, इसलिए सीमा लागू"
+        choices.insert(0, Choice(
+            key="auto", kind="video", title="⚡ Auto Best • 🔊 आवाज़ पक्की",
+            meta=f"{ameta} • अनुमानित {human_size(vids[0].size)}",
+            size=vids[0].size, height=vids[0].height, container=acont,
+            needs_ffmpeg=ff_ok, fmt=afmt))
+
+    # ---- सिर्फ़ आवाज़ / AUDIO ONLY (अलग सेक्शन) ----
+    if aac:
+        f = aac[0]
+        choices.append(Choice(
+            key="a_m4a", kind="audio",
+            title=f"🎵 मूल आवाज़ • M4A/AAC {int(f.get('abr') or 128)}kbps",
+            meta=f"{human_size(_fsize(f, dur))} • हर प्लेयर में चलेगी",
+            size=_fsize(f, dur), container="m4a",
+            fmt=f"{f['format_id']}/bestaudio[ext=m4a]/bestaudio"))
+    if aonly and (not aac or aonly[0]["format_id"] != aac[0]["format_id"]):
+        f = aonly[0]
+        choices.append(Choice(
+            key="a_best", kind="audio",
+            title=f"🎵 सर्वोच्च बिटरेट • {str(f.get('ext','webm')).upper()} "
+                  f"{int(f.get('abr') or 160)}kbps",
+            meta=f"{human_size(_fsize(f, dur))} • सबसे छोटी फाइल, अच्छी गुणवत्ता",
+            size=_fsize(f, dur), container=str(f.get("ext", "webm")),
+            fmt=f"{f['format_id']}/bestaudio/best"))
+    if aonly or prog:
+        base = _fsize(aonly[0], dur) if aonly else 0
+        choices.append(Choice(
+            key="a_mp3", kind="audio", title="🎧 MP3 में बदलें • 192kbps",
+            meta=(f"लगभग {human_size(int(192*1000/8*(dur or 0)))} • FFmpeg से conversion"
+                  if ff_ok else "FFmpeg इंस्टॉल करें — तब MP3 बन सकेगी"),
+            size=base or int(192 * 1000 / 8 * (dur or 0)), container="mp3",
+            needs_ffmpeg=True, available=ff_ok, reason="FFmpeg चाहिए",
+            fmt="bestaudio/best",
+            pp=[{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                 "preferredquality": "192"}]))
+    return choices, blocked
+
+
+# =====================================================================
+#  भाग 5 / PART 5 — डाउनलोड इंजन (कतार + सत्यापन + मरम्मत)
+#                 Download engine (queue + verification + repair)
+# =====================================================================
+class YdlLog:
+    def __init__(self, sink): self.sink = sink
+    def debug(self, m):
+        m = clean_ansi(m)
+        if m and not m.startswith("[debug]"):
+            self.sink("debug", m)
+    def info(self, m): self.debug(m)
+    def warning(self, m): self.sink("warning", clean_ansi(m))
+    def error(self, m): self.sink("error", clean_ansi(m))
+
+
+class Cancelled(Exception):
     pass
 
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ultra_downloader_pro.json")
+class Downloader:
+    def __init__(self, emit):
+        self.emit = emit
+        self.q = deque()
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.busy = False
 
-PALETTE = {
-    True: dict(  # dark
-        page="#0B0F19", card="#131C2E", panel="#1E293B", item="#0F172A",
-        text="#E2E8F0", muted="#94A3B8", accent="#60A5FA",
-    ),
-    False: dict(  # light
-        page="#F1F5F9", card="#FFFFFF", panel="#E2E8F0", item="#CBD5E1",
-        text="#0F172A", muted="#475569", accent="#1D4ED8",
-    ),
-}
+    # ---- कतार / queue ----
+    def submit(self, task: dict):
+        with self.lock:
+            self.q.append(task)
+            start = self.worker is None or not self.worker.is_alive()
+            if start:
+                self.worker = threading.Thread(target=self._loop, daemon=True)
+        self.emit({"type": "queue", "n": len(self.q)})
+        if start:
+            self.worker.start()
 
-OK, WARN, ERR, INFO = "#4ADE80", "#FBBF24", "#F87171", "#60A5FA"
+    def cancel(self):
+        self.stop.set()
+
+    def drop_queue(self):
+        with self.lock:
+            self.q.clear()
+        self.emit({"type": "queue", "n": 0})
+
+    def _loop(self):
+        while True:
+            with self.lock:
+                if not self.q:
+                    self.busy = False
+                    return
+                task = self.q.popleft()
+                self.busy = True
+            self.stop.clear()
+            self.emit({"type": "queue", "n": len(self.q)})
+            try:
+                self._run(task)
+            except Cancelled:
+                self.emit({"type": "cancelled", "task": task})
+            except Exception as ex:
+                if self.stop.is_set():
+                    self.emit({"type": "cancelled", "task": task})
+                else:
+                    self.emit({"type": "error", "msg": friendly_error(ex), "task": task})
+            finally:
+                self.emit({"type": "idle"})
+
+    # ---- विकल्प / options ----
+    def _opts(self, task, ff: FF):
+        ch: Choice = task["choice"]
+        prefs = task["prefs"]
+        save = task["save_dir"]
+        if ch.needs_ffmpeg and not ff.ok:
+            raise RuntimeError("FFmpeg नहीं मिला — यह विकल्प अभी संभव नहीं।")
+        if "+" in ch.fmt and not ff.ok:
+            raise RuntimeError("मर्ज के लिए FFmpeg अनिवार्य है (बेआवाज़ फाइल नहीं बनाएँगे)।")
+
+        tagname = f"[{ch.height}p]" if ch.height else "[video]"
+        if ch.kind == "audio":
+            tagname = "[audio]"
+        opts = {
+            "format": ch.fmt,
+            "outtmpl": os.path.join(save, "%(title).120B " + tagname + ".%(ext)s"),
+            "outtmpl_na_placeholder": "best",
+            "noplaylist": True, "continuedl": True, "quiet": True, "noprogress": True,
+            "logger": YdlLog(lambda lvl, m: self.emit({"type": "log", "lvl": lvl, "msg": m})),
+            "retries": 10, "fragment_retries": 10, "extractor_retries": 3,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": int(prefs.get("frags", 8)),
+            "progress_hooks": [self._hook],
+            "postprocessor_hooks": [self._pp],
+            "windowsfilenames": IS_WIN,
+        }
+        if prefs.get("turbo", True):
+            opts["http_chunk_size"] = 10 * 1024 * 1024
+        if ff.ok:
+            opts["ffmpeg_location"] = ff.folder
+        if ch.needs_ffmpeg and "+" in ch.fmt:
+            opts["merge_output_format"] = ch.container
+        if ch.pp:
+            opts["postprocessors"] = ch.pp
+        ck = prefs.get("cookies") or ""
+        if ck and os.path.isfile(ck):
+            opts["cookiefile"] = ck
+        if task.get("partial_dir"):
+            opts["paths"] = {"temp": task["partial_dir"]}
+        return opts
+
+    def _hook(self, d):
+        if self.stop.is_set():
+            raise Cancelled()
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            self.emit({"type": "progress",
+                       "p": (done / total) if total else None,
+                       "done": done, "total": total,
+                       "speed": clean_ansi(d.get("_speed_str") or "--"),
+                       "eta": clean_ansi(d.get("_eta_str") or "--"),
+                       "file": d.get("tmpfilename") or d.get("filename") or ""})
+        elif st == "finished":
+            self.emit({"type": "phase", "phase": "merge",
+                       "file": d.get("filename") or ""})
+
+    def _pp(self, d):
+        if self.stop.is_set() and d.get("status") == "started":
+            raise Cancelled()
+        self.emit({"type": "phase", "phase": "merge"})
+
+    def _run(self, task):
+        ch: Choice = task["choice"]
+        ff: FF = task["ff"]
+        os.makedirs(task["save_dir"], exist_ok=True)
+        self.emit({"type": "phase", "phase": "download", "title": task.get("title", "Video")})
+        with yt_dlp.YoutubeDL(self._opts(task, ff)) as ydl:
+            info = ydl.extract_info(task["url"], download=True)
+
+        path = None
+        for rd in (info.get("requested_downloads") or []):
+            path = rd.get("filepath") or path
+        if not path or not os.path.exists(path):
+            files = glob.glob(os.path.join(task["save_dir"], "*"))
+            path = max(files, key=os.path.getmtime) if files else None
+        size = os.path.getsize(path) if path and os.path.exists(path) else 0
+
+        audio = True if ch.kind == "audio" else probe_audio(path)
+        entry = {"title": info.get("title") or task.get("title", "Video"),
+                 "path": path or "", "size": size, "kind": ch.kind,
+                 "quality": (f"{ch.height}p" if ch.height else ch.container.upper()),
+                 "audio": audio, "url": task["url"], "ts": time.time(),
+                 "choice": ch.key}
+        self.emit({"type": "done", "entry": entry})
+
+    # ---- 🔇 मरम्मत / repair ----
+    def repair(self, entry, ff: FF, prefs):
+        def work():
+            try:
+                vp = entry.get("path") or ""
+                if not (ff.ok and os.path.isfile(vp)):
+                    self.emit({"type": "error", "msg": "मरम्मत के लिए FFmpeg और मूल फाइल चाहिए।"})
+                    return
+                self.emit({"type": "phase", "phase": "repair", "title": entry["title"]})
+                tmp = os.path.join(os.path.dirname(vp), ".ultra_fix")
+                os.makedirs(tmp, exist_ok=True)
+                with yt_dlp.YoutubeDL({
+                    "format": "bestaudio[ext=m4a]/bestaudio/best",
+                    "outtmpl": os.path.join(tmp, "a.%(ext)s"),
+                    "quiet": True, "noprogress": True, "noplaylist": True,
+                    "ffmpeg_location": ff.folder,
+                    "progress_hooks": [self._hook],
+                }) as ydl:
+                    ai = ydl.extract_info(entry["url"], download=True)
+                ap = None
+                for rd in (ai.get("requested_downloads") or []):
+                    ap = rd.get("filepath") or ap
+                if not ap:
+                    got = glob.glob(os.path.join(tmp, "a.*"))
+                    ap = got[0] if got else None
+                if not ap:
+                    raise RuntimeError("ऑडियो ट्रैक डाउनलोड नहीं हो सका।")
+                out = os.path.splitext(vp)[0] + " [fixed].mp4"
+                cmd = [ff.exe, "-y", "-i", vp, "-i", ap,
+                       "-map", "0:v:0", "-map", "1:a:0",
+                       "-c", "copy", "-shortest", out]
+                r = subprocess.run(cmd, capture_output=True, timeout=1800)
+                shutil.rmtree(tmp, ignore_errors=True)
+                if r.returncode != 0 or not os.path.exists(out):
+                    raise RuntimeError("FFmpeg मर्ज विफल: " +
+                                       clean_ansi(r.stderr.decode("utf-8", "ignore"))[-140:])
+                e2 = dict(entry, path=out, size=os.path.getsize(out),
+                          audio=probe_audio(out), ts=time.time())
+                self.emit({"type": "done", "entry": e2, "repaired": True})
+            except Exception as ex:
+                self.emit({"type": "error", "msg": friendly_error(ex)})
+            finally:
+                self.emit({"type": "idle"})
+        threading.Thread(target=work, daemon=True).start()
 
 
-def format_bytes(size, unknown="साइज उपलब्ध नहीं"):
-    if not size or size <= 0:
-        return unknown
-    size = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.2f} TB"
+# =====================================================================
+#  भाग 6 / PART 6 — सेल्फ-टेस्ट (मैं यहाँ कोड चला नहीं सकता, आप चलाएँ)
+#                 SELF-TEST (I cannot execute code here; you run it)
+# =====================================================================
+def _box(t, p): return struct.pack(">I", len(p) + 8) + t + p
+def _trak(kind): return _box(b"trak", _box(b"mdia",
+                             _box(b"hdlr", b"\0" * 8 + kind + b"\0" * 12)))
+def _fake_mp4(kinds):
+    return (_box(b"ftyp", b"isom" + b"\0" * 4 + b"isom") +
+            _box(b"mdat", b"\0" * 64) +
+            _box(b"moov", b"".join(_trak(k) for k in kinds)))
 
 
-def format_duration(seconds):
-    if not seconds:
-        return "—"
-    seconds = int(seconds)
-    hrs, rem = divmod(seconds, 3600)
-    mins, secs = divmod(rem, 60)
-    return f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+def selftest() -> int:
+    import tempfile
+    fails = []
+
+    def check(name, cond):
+        print(("✅ " if cond else "❌ ") + name)
+        if not cond:
+            fails.append(name)
+
+    d = tempfile.mkdtemp()
+    v = os.path.join(d, "v.mp4"); va = os.path.join(d, "va.mp4")
+    open(v, "wb").write(_fake_mp4([b"vide"]))
+    open(va, "wb").write(_fake_mp4([b"vide", b"soun"]))
+    check("probe_audio: video-only => False", probe_audio(v) is False)
+    check("probe_audio: video+audio => True", probe_audio(va) is True)
+    check("human_size MB", human_size(5 * 1024 * 1024) == "5.0 MB")
+    check("normalize_url", normalize_url("youtu.be/abc") == "https://youtu.be/abc")
+    check("is_url reject", is_url("hello world") is False)
+    check("quality_tag 2160", "4K" in quality_tag(2160))
+
+    info = {"duration": 100, "formats": [
+        {"format_id": "137", "ext": "mp4", "height": 1080, "vcodec": "avc1",
+         "acodec": "none", "tbr": 4000, "fps": 30},
+        {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus", "abr": 160},
+        {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 128},
+        {"format_id": "18", "ext": "mp4", "height": 360, "vcodec": "avc1",
+         "acodec": "mp4a.40.2", "tbr": 600},
+    ]}
+    prefs = {"container": "mp4", "codec": "compat", "hls": True}
+
+    ch_ff, blocked_ff = build_choices(info, True, prefs)
+    vids = [c for c in ch_ff if c.kind == "video" and c.available]
+    check("FFmpeg: 1080p merged मौजूद", any(c.key == "v1080m" for c in vids))
+    check("FFmpeg: हर video में '+' या combined",
+          all(("+" in c.fmt) or ("acodec!=none" in c.fmt) or c.key.endswith("d")
+              for c in vids))
+    check("FFmpeg: कोई locked नहीं", not blocked_ff)
+    check("FFmpeg: audio सेक्शन मौजूद",
+          any(c.kind == "audio" and c.key == "a_mp3" and c.available for c in ch_ff))
+
+    ch_no, blocked_no = build_choices(info, False, prefs)
+    vids_no = [c for c in ch_no if c.kind == "video" and c.available]
+    check("बिना FFmpeg: कोई '+' नहीं (बेआवाज़ फाइल असंभव)",
+          all("+" not in c.fmt for c in vids_no))
+    check("बिना FFmpeg: 1080p locked दिखेगा", 1080 in blocked_no)
+    check("बिना FFmpeg: 360p direct मौजूद", any(c.key == "v360d" for c in vids_no))
+    check("बिना FFmpeg: MP3 disabled",
+          any(c.key == "a_mp3" and not c.available for c in ch_no))
+    check("container auto: vp9+opus => webm",
+          pick_container("vp9", "opus", "auto") == "webm")
+    check("container auto: avc1+aac => mp4",
+          pick_container("avc1.640028", "mp4a.40.2", "auto") == "mp4")
+    shutil.rmtree(d, ignore_errors=True)
+    print(f"\n{'🎉 सब पास' if not fails else '⚠️ विफल: ' + ', '.join(fails)}")
+    return 1 if fails else 0
 
 
-def clean_ansi(text):
-    return re.sub(r"\x1b\[[0-9;]*m", "", str(text)).strip()
+# =====================================================================
+#  भाग 7 / PART 7 — UI (Flet)
+# =====================================================================
+def config_dir() -> str:
+    base = (os.environ.get("FLET_APP_STORAGE_DATA") if IS_ANDROID else None) or \
+        os.path.join(os.path.expanduser("~"), ".ultra_downloader_pro")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        base = os.path.expanduser("~")
+    return base
 
 
-def looks_like_url(text):
-    return bool(re.match(r"^https?://\S+\.\S+", (text or "").strip(), re.I))
+CFG = os.path.join(config_dir(), "settings.json")
+HIST = os.path.join(config_dir(), "history.json")
+
+DEF_PREFS = {"dark": True, "save_dir": "", "container": "mp4", "codec": "compat",
+             "turbo": True, "frags": 8, "delete_partial": False, "open_after": False,
+             "hls": True, "cookies": "", "ff_custom": ""}
 
 
-def friendly_error(ex):
-    msg = clean_ansi(str(ex))
-    low = msg.lower()
-    if "sign in to confirm" in low or "not a bot" in low:
-        return "YouTube ने bot-check माँगा। कुछ देर बाद या दूसरे नेटवर्क पर कोशिश करें।"
-    if "private video" in low:
-        return "यह वीडियो Private है, डाउनलोड नहीं हो सकता।"
-    if "unsupported url" in low:
-        return "यह लिंक सपोर्टेड नहीं है। सही वीडियो लिंक डालें।"
-    if "http error 403" in low:
-        return "सर्वर ने एक्सेस रोका (403)। yt-dlp अपडेट करें: pip install -U yt-dlp"
-    if "ffmpeg" in low:
-        return "FFmpeg नहीं मिला। मर्ज के लिए FFmpeg इंस्टॉल करें।"
-    if "urlopen error" in low or "getaddrinfo" in low or "timed out" in low:
-        return "इंटरनेट कनेक्शन की समस्या। नेटवर्क जाँचकर दोबारा कोशिश करें।"
-    return msg[:110]
+def load_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return fallback
 
 
-def quality_tag(h):
-    if h >= 4320:
-        return f"8K UHD ({h}p)"
-    if h >= 2160:
-        return f"4K Ultra HD ({h}p)"
-    if h >= 1440:
-        return f"2K QHD ({h}p)"
-    if h >= 1080:
-        return "1080p Full HD"
-    if h >= 720:
-        return "720p HD"
-    if h >= 480:
-        return "480p Standard"
-    if h >= 360:
-        return "360p Medium"
-    return f"{h}p Data Saver"
+def save_json(path, data):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        pass
 
 
-def default_quality_items(has_ffmpeg):
-    """Quality list shown before any scan (sizes unknown until 'Scan')."""
-    def f(h):
-        if has_ffmpeg:
-            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-        return f"best[height<={h}]/best"
-
-    fmt_map = {
-        "auto_best": "bestvideo+bestaudio/best" if has_ffmpeg else "best[ext=mp4]/best",
-        "q_2160": f(2160), "q_1080": f(1080), "q_720": f(720),
-        "q_480": f(480), "q_360": f(360),
-        "auto_audio": "bestaudio/best",
-    }
-    scan_hint = "Scan दबाएं"
-    items = [
-        {"key": "auto_best", "title": "⚡ Auto Best Quality", "size": scan_hint, "kind": "video"},
-        {"key": "q_2160", "title": "🎬 4K Ultra HD (2160p)", "size": scan_hint, "kind": "video"},
-        {"key": "q_1080", "title": "🎬 1080p Full HD", "size": scan_hint, "kind": "video"},
-        {"key": "q_720", "title": "🎬 720p HD", "size": scan_hint, "kind": "video"},
-        {"key": "q_480", "title": "🎬 480p Standard", "size": scan_hint, "kind": "video"},
-        {"key": "q_360", "title": "🎬 360p Data Saver", "size": scan_hint, "kind": "video"},
-        {"key": "auto_audio", "title": "🎵 Best Audio Only", "size": "Audio", "kind": "audio"},
-    ]
-    return items, fmt_map, {}
-
-
-def build_quality_items(info, has_ffmpeg):
-    """Turn yt-dlp info into (items, format_map, extra_opts) with exact sizes."""
-    duration = info.get("duration") or 0
-    formats = info.get("formats") or []
-
-    def fsize(f):
-        sz = f.get("filesize") or f.get("filesize_approx")
-        if not sz and duration:
-            br = f.get("tbr") or f.get("vbr") or f.get("abr")
-            if br:
-                sz = int((br * 1000 / 8) * duration)
-        return sz or 0
-
-    audio_formats = [
-        f for f in formats
-        if f.get("acodec") not in ("none", None) and f.get("vcodec") in ("none", None)
-    ]
-    audio_formats.sort(key=lambda x: (x.get("abr") or 0, fsize(x)), reverse=True)
-    best_audio = audio_formats[0] if audio_formats else None
-    best_audio_size = fsize(best_audio) if best_audio else 0
-    best_audio_id = best_audio.get("format_id") if best_audio else "bestaudio"
-
-    groups = {}
-    for f in formats:
-        vcodec, height = f.get("vcodec"), f.get("height")
-        if not vcodec or vcodec == "none" or not height:
-            continue
-        has_aud = f.get("acodec") not in ("none", None)
-        size, tbr = fsize(f), (f.get("tbr") or f.get("vbr") or 0)
-        slot = "combined" if has_aud else "vo"
-        grp = groups.setdefault(height, {"combined": None, "vo": None})
-        cur = grp[slot]
-        if not cur or (tbr, size) > (cur["tbr"], cur["size"]):
-            grp[slot] = {
-                "id": f.get("format_id"), "size": size, "tbr": tbr,
-                "ext": f.get("ext", "mp4"), "fps": int(f.get("fps") or 30),
-            }
-
-    items, fmt_map, extra = [], {}, {}
-    for h in sorted(groups, reverse=True):
-        comb, vo = groups[h]["combined"], groups[h]["vo"]
-        tag = quality_tag(h)
-
-        if vo and has_ffmpeg:
-            key = f"res_{h}_merged"
-            total = (vo["size"] + best_audio_size) if vo["size"] else 0
-            fps = f" {vo['fps']}fps" if vo["fps"] > 30 else ""
-            items.append({"key": key, "title": f"🌟 {tag}{fps} (MP4 High-Bitrate)",
-                          "size": format_bytes(total), "kind": "video"})
-            fmt_map[key] = (f"{vo['id']}+{best_audio_id}/bestvideo[height<={h}]"
-                            f"+bestaudio/best[height<={h}]/best")
-        if comb:
-            key = f"res_{h}_comb"
-            fps = f" {comb['fps']}fps" if comb["fps"] > 30 else ""
-            items.append({"key": key, "title": f"🎬 {tag}{fps} ({str(comb['ext']).upper()} Direct)",
-                          "size": format_bytes(comb["size"]), "kind": "video"})
-            fmt_map[key] = f"{comb['id']}/best[height<={h}]/best"
-        if vo and not has_ffmpeg and not comb:
-            key = f"res_{h}_raw"
-            items.append({"key": key, "title": f"📹 {tag} ({str(vo['ext']).upper()}) • बिना आवाज़",
-                          "size": format_bytes(vo["size"]), "kind": "video"})
-            fmt_map[key] = f"{vo['id']}/best[height<={h}]/best"
-
-    for idx, af in enumerate(audio_formats[:2]):
-        key = f"audio_{idx}"
-        tag = "Best Original Audio" if idx == 0 else "Medium Saver Audio"
-        items.append({"key": key,
-                      "title": f"🎵 {tag} ({str(af.get('ext', 'm4a')).upper()} {int(af.get('abr') or 128)}kbps)",
-                      "size": format_bytes(fsize(af)), "kind": "audio"})
-        fmt_map[key] = f"{af.get('format_id')}/bestaudio/best"
-
-    if has_ffmpeg and audio_formats:
-        items.append({"key": "audio_mp3", "title": "🎧 MP3 में बदलें (192 kbps)",
-                      "size": format_bytes(best_audio_size), "kind": "audio"})
-        fmt_map["audio_mp3"] = "bestaudio/best"
-        extra["audio_mp3"] = {"postprocessors": [{
-            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]}
-
-    if items:
-        first_video = next((i for i in items if i["kind"] == "video"), items[0])
-        items.insert(0, {"key": "auto_best", "title": "⚡ Auto Best Quality (Recommended)",
-                         "size": first_video["size"], "kind": "video"})
-        fmt_map["auto_best"] = "bestvideo+bestaudio/best" if has_ffmpeg else "best[ext=mp4]/best"
-    return items, fmt_map, extra
+def default_save_dir() -> str:
+    if IS_ANDROID:
+        return "/storage/emulated/0/Download/UltraVideos"
+    return os.path.join(os.path.expanduser("~"), "Downloads", "UltraVideos")
 
 
 def img_fit():
-    try:
-        return ft.BoxFit.COVER
-    except Exception:
-        try:
-            return ft.ImageFit.COVER
-        except Exception:
-            return None
+    for attr in ("BoxFit", "ImageFit"):
+        o = getattr(ft, attr, None)
+        if o is not None and hasattr(o, "COVER"):
+            return o.COVER
+    return None
 
 
-# ======================================================================
-# App
-# ======================================================================
 def main(page: ft.Page):
     try:
         build_app(page)
     except Exception:
-        page.add(ft.Text(f"Startup Error:\n{traceback.format_exc()}",
+        page.add(ft.Text("Startup Error:\n" + traceback.format_exc(),
                          color=ERR, selectable=True))
         page.update()
 
 
 def build_app(page: ft.Page):
-    page.title = "Ultra Video Downloader Pro"
-    page.padding = 12
-    for attr, val in (("theme_mode", ft.ThemeMode.DARK), ("scroll", ft.ScrollMode.AUTO),
-                      ("horizontal_alignment", ft.CrossAxisAlignment.CENTER)):
+    prefs = dict(DEF_PREFS, **load_json(CFG, {}))
+    if not prefs.get("save_dir"):
+        prefs["save_dir"] = default_save_dir()
+    ff = discover_ffmpeg(prefs.get("ff_custom", ""))
+
+    if IS_ANDROID:
         try:
-            setattr(page, attr, val)
+            import certifi
+            os.environ.setdefault("SSL_CERT_FILE", certifi.where())
         except Exception:
             pass
+
+    st = {"tab": "download", "choices": [], "blocked": [], "selected": "auto",
+          "meta": {}, "phase": "idle", "p": None, "done": 0, "total": 0,
+          "speed": "--", "eta": "--", "status": "✅ तैयार — लिंक डालकर Scan दबाएँ।",
+          "scol": OK, "queue": 0, "rev": 0, "hist": load_json(HIST, []),
+          "scanning": False, "card_w": 560, "last_warn": ""}
+    stop = threading.Event()
+
+    page.title = f"{APP_NAME} {APP_VER}"
+    page.padding = 10
     try:
-        page.window.width = 560
-        page.window.height = 900
-        page.window.min_width = 340
-        page.window.min_height = 560
+        page.theme_mode = ft.ThemeMode.DARK if prefs["dark"] else ft.ThemeMode.LIGHT
+        page.scroll = ft.ScrollMode.AUTO
+        page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     except Exception:
         pass
-
-    is_android = os.path.exists("/storage/emulated/0")
-    has_ffmpeg = shutil.which("ffmpeg") is not None
-
-    if is_android:
-        default_dir = "/storage/emulated/0/Download/UltraVideos"
-    else:
-        default_dir = os.path.join(os.path.expanduser("~"), "Downloads", "UltraVideos")
-
-    state = {
-        "save_dir": default_dir, "dark": True, "turbo": True,
-        "delete_partial": False, "open_after": False,
-        "cancel": False, "downloading": False, "scanning": False,
-        "selected": "auto_best", "items": [], "fmt_map": {}, "extra": {},
-        "touched": set(), "card_w": 560, "last_ui": 0.0,
-    }
-
-    # ---------- settings persistence ----------
-    def load_settings():
+    if not IS_ANDROID:
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            for k in ("save_dir", "dark", "turbo", "delete_partial", "open_after"):
-                if k in data:
-                    state[k] = data[k]
+            page.window.width, page.window.height = 580, 940
+            page.window.min_width, page.window.min_height = 340, 560
         except Exception:
             pass
 
-    def save_settings():
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-                json.dump({k: state[k] for k in
-                           ("save_dir", "dark", "turbo", "delete_partial", "open_after")}, fh)
-        except Exception:
-            pass
+    pal = lambda: PAL[bool(prefs["dark"])]
+    static_texts, static_boxes = [], []
 
-    load_settings()
-    try:
-        os.makedirs(state["save_dir"], exist_ok=True)
-    except Exception:
-        pass
-
-    pal = lambda: PALETTE[state["dark"]]
-    themed_text, themed_box = [], []
-
-    # ---------- widget factories ----------
-    def T(value="", role="text", size=13, bold=False, color=None):
-        t = ft.Text(value, size=size, text_align=ft.TextAlign.CENTER,
-                    weight=ft.FontWeight.BOLD if bold else None,
-                    color=color or pal()[role])
-        if not color:
-            themed_text.append((t, role))
+    # ---------- factories ----------
+    def T(v="", role="text", size=13, bold=False, color=None, reg=False,
+          align=ft.TextAlign.LEFT):
+        t = ft.Text(v, size=size, color=color or pal()[role],
+                    weight=ft.FontWeight.BOLD if bold else None, text_align=align)
+        if reg and not color:
+            static_texts.append((t, role))
         return t
 
-    def box(content, role="panel", padding=14, radius=14, width=None):
-        c = ft.Container(content=content, bgcolor=pal()[role], padding=padding,
-                        border_radius=radius, width=width)
-        themed_box.append((c, role))
+    def panel(content, role="panel", pad=12, radius=14, reg=False, visible=True):
+        c = ft.Container(content=content, bgcolor=pal()[role], padding=pad,
+                         border_radius=radius, visible=visible)
+        if reg:
+            static_boxes.append((c, role))
         return c
 
-    def btn(label, bg, on_click, height=44, size=13, fg="#FFFFFF"):
+    def button(label, bg, click, h=44, size=13, fg="#FFFFFF", enabled=True):
         t = ft.Text(label, size=size, weight=ft.FontWeight.BOLD, color=fg,
                     text_align=ft.TextAlign.CENTER)
-        return ft.Container(content=t, bgcolor=bg, height=height, border_radius=10,
-                            padding=6, alignment=ft.Alignment(0, 0), ink=True,
-                            on_click=on_click, data=t)
+        c = ft.Container(content=t, bgcolor=bg, height=h, border_radius=10,
+                         padding=6, alignment=ft.Alignment(0, 0), ink=enabled,
+                         on_click=click if enabled else None,
+                         opacity=1.0 if enabled else 0.45, data=t)
+        return c
 
-    def tell(msg, color=INFO):
-        status_label.value = msg
-        status_label.color = color
-        page.update()
+    groups = []
+
+    def grp(buttons, max_per, min_w, gap=8):
+        host = ft.Column(controls=[], spacing=gap,
+                         horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        groups.append((host, buttons, max_per, min_w, gap))
+        return host
+
+    def layout():
+        w = max(240, st["card_w"] - 56)
+        for host, bs, mx, mw, gap in groups:
+            per = max(1, min(mx, int((w + gap) // (mw + gap)), len(bs)))
+            bw = (w - gap * (per - 1)) / per
+            rows = []
+            for i in range(0, len(bs), per):
+                chunk = bs[i:i + per]
+                for b in chunk:
+                    b.width = bw
+                rows.append(ft.Row(chunk, spacing=gap,
+                                   alignment=ft.MainAxisAlignment.CENTER))
+            host.controls = rows
+
+    def say(msg, col=INFO):
+        st["status"], st["scol"] = msg, col
 
     def toast(msg):
         try:
@@ -342,646 +938,799 @@ def build_app(page: ft.Page):
             else:
                 page.snack_bar = bar
                 bar.open = True
+            page.update()
         except Exception:
             pass
 
-    # ---------- responsive geometry ----------
-    def inner_w():            # usable width inside the main card
-        return max(220, state["card_w"] - 32)
+    def persist():
+        save_json(CFG, prefs)
 
-    def panel_w():            # usable width inside a panel (card inner - panel padding)
-        return max(200, inner_w() - 28)
+    # ---------- header + nav ----------
+    title_t = T("VICONGENUMBA", "accent", 22, True, reg=True,
+                align=ft.TextAlign.CENTER)
+    sub_t = T("हर वीडियो में आवाज़ अनिवार्य • अलग से सिर्फ़-ऑडियो सेक्शन",
+              "muted", 11, reg=True, align=ft.TextAlign.CENTER)
+    ff_t = ft.Text("", size=11, weight=ft.FontWeight.BOLD, color="#FFFFFF",
+                   text_align=ft.TextAlign.CENTER)
+    ff_chip = ft.Container(content=ff_t, padding=7, border_radius=20, ink=True,
+                           on_click=lambda e: set_tab("settings"))
 
-    button_groups = []        # (host Column, [buttons], max_per_row, min_w, width_fn)
+    def refresh_ff():
+        ff_t.value = (f"✓ FFmpeg सक्रिय • {ff.source}" if ff.ok
+                      else "⚠ FFmpeg नहीं मिला • HD सीमित (टैप करें)")
+        ff_chip.bgcolor = "#15803D" if ff.ok else "#B45309"
 
-    def reg_group(buttons, max_per_row, min_w, width_fn=None, spacing=8):
-        host = ft.Column(controls=[], spacing=spacing,
+    refresh_ff()
+
+    nav_specs = [("download", "⬇️ डाउनलोड"), ("history", "📜 इतिहास"),
+                 ("settings", "⚙️ सेटिंग्स")]
+    nav_btns = {}
+    for k, lab in nav_specs:
+        t = ft.Text(lab, size=12, weight=ft.FontWeight.BOLD,
+                    text_align=ft.TextAlign.CENTER)
+        c = ft.Container(content=t, padding=9, border_radius=10, ink=True,
+                         alignment=ft.Alignment(0, 0),
+                         on_click=lambda e, kk=k: set_tab(kk))
+        nav_btns[k] = (c, t)
+    nav_row = grp([nav_btns[k][0] for k, _ in nav_specs], 3, 110)
+
+    theme_btn = button("☀️/🌙", "#334155", lambda e: toggle_theme(), 34, 12)
+
+    def refresh_nav():
+        for k, (c, t) in nav_btns.items():
+            on = st["tab"] == k
+            c.bgcolor = "#1D4ED8" if on else pal()["item"]
+            t.color = "#FFFFFF" if on else pal()["muted"]
+
+    # ---------- URL + scan ----------
+    url_field = ft.TextField(label="वीडियो लिंक (YouTube / Instagram / Facebook…)",
+                             hint_text="https://youtu.be/…", border_radius=12,
+                             text_align=ft.TextAlign.LEFT, height=58,
+                             on_submit=lambda e: do_scan())
+
+    preview_col = ft.Column(controls=[], spacing=6,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+    preview_card = panel(preview_col, reg=True, visible=False)
+
+    warn_t = T("", "text", 12, True)
+    warn_card = ft.Container(content=warn_t, bgcolor="#7C2D12", padding=10,
+                             border_radius=12, visible=False)
+
+    sel_t = T("", "text", 12, True, color=OK)
+    quality_col = ft.Column(controls=[], spacing=7,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    folder_t = T("", "muted", 11)
+    progress_bar = ft.ProgressBar(value=0, visible=False)
+    pct_t = T("", "accent", 26, True, align=ft.TextAlign.CENTER)
+    status_t = T(st["status"], "text", 13, True, color=OK, align=ft.TextAlign.CENTER)
+    stats_t = T("डेटा: --  •  स्पीड: --  •  बचा समय: --", "muted", 11,
+                align=ft.TextAlign.CENTER)
+    queue_t = T("", "muted", 11, align=ft.TextAlign.CENTER)
+
+    hist_col = ft.Column(controls=[], spacing=7,
                          horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-        button_groups.append((host, buttons, max_per_row, min_w, width_fn or inner_w, spacing))
-        return host
+    set_col = ft.Column(controls=[], spacing=9,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
-    def layout_groups():
-        for host, buttons, max_per, min_w, width_fn, gap in button_groups:
-            w = width_fn()
-            per = max(1, min(max_per, int((w + gap) // (min_w + gap))))
-            per = min(per, len(buttons))
-            bw = (w - gap * (per - 1)) / per
-            rows = []
-            for i in range(0, len(buttons), per):
-                chunk = buttons[i:i + per]
-                for b in chunk:
-                    b.width = bw
-                rows.append(ft.Row(controls=chunk, spacing=gap,
-                                   alignment=ft.MainAxisAlignment.CENTER))
-            host.controls = rows
+    # ---------- rendering ----------
+    def render_preview():
+        preview_col.controls.clear()
+        m = st["meta"]
+        if not m:
+            preview_card.visible = False
+            return
+        th = m.get("thumbnail")
+        if th and str(th).startswith("http"):
+            try:
+                tw = min(max(220, st["card_w"] - 90), 340)
+                kw = dict(src=th, width=tw, height=int(tw * 9 / 16), border_radius=10)
+                f = img_fit()
+                if f is not None:
+                    kw["fit"] = f
+                preview_col.controls.append(ft.Image(**kw))
+            except Exception:
+                pass
+        preview_col.controls.append(T(m.get("title", "Video"), "accent", 14, True,
+                                      align=ft.TextAlign.CENTER))
+        preview_col.controls.append(T(
+            f"{m.get('uploader') or '—'} • {human_dur(m.get('duration'))} • "
+            f"{m.get('extractor', '')}", "muted", 11, align=ft.TextAlign.CENTER))
+        preview_card.visible = True
 
-    # ---------- theme ----------
+    def render_choices():
+        quality_col.controls.clear()
+        w = max(240, st["card_w"] - 72)
+        last = None
+        for c in st["choices"]:
+            if c.kind != last:
+                last = c.kind
+                quality_col.controls.append(ft.Container(
+                    content=T("🎬 वीडियो + 🔊 आवाज़ (एक ही फाइल)" if last == "video"
+                              else "🎵 सिर्फ़ आवाज़ (अलग डाउनलोड)",
+                              "accent", 13, True, align=ft.TextAlign.CENTER),
+                    width=w, padding=4, alignment=ft.Alignment(0, 0)))
+            sel = c.key == st["selected"] and c.available
+            bg = "#1D4ED8" if sel else (pal()["item"] if c.available else pal()["panel"])
+            fg = "#FFFFFF" if sel else pal()["text"]
+            mark = "🔘" if sel else ("⚪" if c.available else "🔒")
+            col = ft.Column([
+                ft.Text(f"{mark}  {c.title}", size=13, weight=ft.FontWeight.BOLD,
+                        color=fg if c.available else pal()["muted"]),
+                ft.Text(f"📦 {c.meta}", size=11,
+                        color="#DCFCE7" if sel else pal()["muted"]),
+            ], spacing=3)
+            quality_col.controls.append(ft.Container(
+                content=col, bgcolor=bg, padding=10, border_radius=11, width=w,
+                ink=c.available, opacity=1.0 if c.available else 0.6,
+                on_click=(lambda e, k=c.key: pick_choice(k)) if c.available else None))
+        cur = next((c for c in st["choices"] if c.key == st["selected"]), None)
+        sel_t.value = (f"✓ चुना गया: {cur.title}" if cur else "कोई विकल्प नहीं")
+        if st["blocked"] and not ff.ok:
+            warn_t.value = ("⚠ FFmpeg नहीं मिला, इसलिए " +
+                            ", ".join(f"{h}p" for h in st["blocked"][:4]) +
+                            " आवाज़ के साथ नहीं मिल सकती। सेटिंग्स में FFmpeg जोड़ें "
+                            "या 🔒 वाली क्वालिटी के बजाय उपलब्ध विकल्प चुनें।")
+            warn_card.visible = True
+        elif st["last_warn"]:
+            warn_t.value = "⚠ " + st["last_warn"]
+            warn_card.visible = True
+        else:
+            warn_card.visible = False
+
+    def render_history():
+        hist_col.controls.clear()
+        w = max(240, st["card_w"] - 72)
+        if not st["hist"]:
+            hist_col.controls.append(T("अभी कोई डाउनलोड नहीं।", "muted", 12,
+                                       align=ft.TextAlign.CENTER))
+            return
+        for i, h in enumerate(st["hist"][:60]):
+            a = h.get("audio")
+            badge = "🔊 आवाज़ सत्यापित" if a is True else (
+                "🔇 आवाज़ नहीं मिली!" if a is False else "❔ सत्यापन संभव नहीं")
+            bcol = "#166534" if a is True else ("#7F1D1D" if a is False else "#334155")
+            rows = [
+                ft.Text("✓ " + str(h.get("title", ""))[:90], size=12,
+                        weight=ft.FontWeight.BOLD, color=pal()["text"]),
+                ft.Text(f"{h.get('quality','')} • {human_size(h.get('size'))} • "
+                        f"{time.strftime('%d %b %H:%M', time.localtime(h.get('ts', 0)))}",
+                        size=10, color=pal()["muted"]),
+                ft.Container(content=ft.Text(badge, size=10, color="#FFFFFF",
+                                             weight=ft.FontWeight.BOLD),
+                             bgcolor=bcol, padding=5, border_radius=6),
+            ]
+            acts = [button("📂 फोल्डर", "#334155",
+                           lambda e, p=h.get("path", ""): open_folder_of(p), 32, 10)]
+            if a is False and ff.ok:
+                acts.append(button("🔧 आवाज़ ठीक करें", "#B45309",
+                                   lambda e, idx=i: do_repair(idx), 32, 10))
+            acts.append(button("🗑 हटाएँ", "#475569",
+                               lambda e, idx=i: del_hist(idx), 32, 10))
+            rows.append(grp(acts, 3, 110))
+            hist_col.controls.append(ft.Container(
+                content=ft.Column(rows, spacing=5), bgcolor=pal()["item"],
+                padding=10, border_radius=11, width=w))
+        layout()
+
+    def chip(label, active, click, enabled=True):
+        return ft.Container(
+            content=ft.Text(label, size=11, weight=ft.FontWeight.BOLD,
+                            color="#FFFFFF" if active else pal()["muted"],
+                            text_align=ft.TextAlign.CENTER),
+            bgcolor="#1D4ED8" if active else pal()["item"],
+            padding=8, border_radius=20, ink=enabled, opacity=1 if enabled else .5,
+            on_click=click if enabled else None)
+
+    path_field = ft.TextField(label="सेव फोल्डर पाथ", value=prefs["save_dir"],
+                              border_radius=10, visible=False)
+    ff_field = ft.TextField(label="FFmpeg का पूरा पाथ (खाली = ऑटो खोज)",
+                            value=prefs.get("ff_custom", ""), border_radius=10)
+    cookie_field = ft.TextField(label="cookies.txt का पाथ (वैकल्पिक, लॉगिन के लिए)",
+                                value=prefs.get("cookies", ""), border_radius=10)
+
+    def render_settings():
+        set_col.controls.clear()
+
+        def switch(label, key, after=None):
+            def on_ch(e):
+                prefs[key] = bool(e.control.value)
+                persist()
+                if after:
+                    after()
+                render_settings()
+                page.update()
+            return ft.Switch(label=label, value=bool(prefs[key]), on_change=on_ch)
+
+        set_col.controls.append(T("🎨 दिखावट / Appearance", "accent", 13, True))
+        set_col.controls.append(switch("डार्क मोड", "dark", apply_theme))
+
+        set_col.controls.append(T("📂 सेव फोल्डर / Save folder", "accent", 13, True))
+        set_col.controls.append(T(prefs["save_dir"], "muted", 11))
+        set_col.controls.append(grp([
+            button("📁 चुनें", "#1D4ED8", lambda e: browse(), 38, 12),
+            button("✏️ पाथ लिखें", "#334155", lambda e: toggle_path(), 38, 12),
+            button("📂 खोलें", "#0F766E", lambda e: open_folder(prefs["save_dir"]), 38, 12),
+        ], 3, 110))
+        set_col.controls.append(path_field)
+        set_col.controls.append(button("✓ पाथ सेव करें", "#15803D",
+                                       lambda e: apply_path(path_field.value), 36, 12))
+        set_col.controls.append(grp([
+            button("📥 Downloads", "#0F172A", lambda e: preset("Download", "Downloads"), 32, 10),
+            button("🎬 Movies", "#0F172A", lambda e: preset("Movies", "Videos"), 32, 10),
+            button("🎵 Music", "#0F172A", lambda e: preset("Music", "Music"), 32, 10),
+        ], 3, 100))
+
+        set_col.controls.append(T("🎞️ कंटेनर / Container", "accent", 13, True))
+        set_col.controls.append(grp([
+            chip("MP4 (सब जगह चले)", prefs["container"] == "mp4",
+                 lambda e: set_pref("container", "mp4")),
+            chip("MKV (सुरक्षित मर्ज)", prefs["container"] == "mkv",
+                 lambda e: set_pref("container", "mkv")),
+            chip("Auto (codec अनुसार)", prefs["container"] == "auto",
+                 lambda e: set_pref("container", "auto")),
+        ], 3, 130))
+
+        set_col.controls.append(T("🎯 पसंद / Codec preference", "accent", 13, True))
+        set_col.controls.append(grp([
+            chip("संगतता (H.264+AAC)", prefs["codec"] == "compat",
+                 lambda e: set_pref("codec", "compat")),
+            chip("गुणवत्ता (VP9/AV1+Opus)", prefs["codec"] == "quality",
+                 lambda e: set_pref("codec", "quality")),
+        ], 2, 160))
+
+        set_col.controls.append(T("⚡ गति / Speed", "accent", 13, True))
+        set_col.controls.append(switch("Turbo (10MB chunks)", "turbo"))
+        set_col.controls.append(T(f"समानांतर fragments: {prefs['frags']}", "muted", 11))
+
+        def frag_ch(e):
+            prefs["frags"] = int(e.control.value)
+            persist()
+            render_settings()
+            page.update()
+        set_col.controls.append(ft.Slider(min=1, max=16, divisions=15,
+                                          value=float(prefs["frags"]),
+                                          label="{value}", on_change=frag_ch))
+
+        set_col.controls.append(T("⚙️ व्यवहार / Behaviour", "accent", 13, True))
+        set_col.controls.append(switch("Cancel पर अधूरी फाइल हटाएँ", "delete_partial"))
+        set_col.controls.append(switch("पूरा होने पर फोल्डर खोलें", "open_after"))
+        set_col.controls.append(switch("HLS प्रयोगात्मक विकल्प दिखाएँ", "hls"))
+
+        set_col.controls.append(T("🧰 FFmpeg", "accent", 13, True))
+        set_col.controls.append(T(ff.version or "नहीं मिला — HD मर्ज बंद रहेगा।",
+                                  "muted", 11))
+        set_col.controls.append(ff_field)
+        set_col.controls.append(grp([
+            button("🔎 दोबारा खोजें", "#1D4ED8", lambda e: retest_ff(), 38, 12),
+            button("✓ पाथ लागू करें", "#15803D", lambda e: apply_ff_path(), 38, 12),
+        ], 2, 150))
+
+        set_col.controls.append(T("🔐 लॉगिन / Cookies", "accent", 13, True))
+        set_col.controls.append(cookie_field)
+        set_col.controls.append(button("✓ cookies सेव करें", "#15803D",
+                                       lambda e: apply_cookies(), 36, 12))
+        set_col.controls.append(T(
+            f"{APP_NAME} {APP_VER} • केवल उन्हीं वीडियो को डाउनलोड करें जिनका "
+            "आपको अधिकार है; प्लेटफ़ॉर्म की शर्तों का पालन करें।", "muted", 10))
+        layout()
+
+    # ---------- actions ----------
     def apply_theme():
         p = pal()
         try:
-            page.theme_mode = ft.ThemeMode.DARK if state["dark"] else ft.ThemeMode.LIGHT
+            page.theme_mode = ft.ThemeMode.DARK if prefs["dark"] else ft.ThemeMode.LIGHT
         except Exception:
             pass
         page.bgcolor = p["page"]
-        main_card.bgcolor = p["card"]
-        for c, role in themed_box:
-            c.bgcolor = p[role]
-        for t, role in themed_text:
-            t.color = p[role]
-        theme_txt.value = "☀️ Light Mode" if state["dark"] else "🌙 Dark Mode"
-        render_quality_list()
+        root.bgcolor = p["card"]
+        for c, r in static_boxes:
+            c.bgcolor = p[r]
+        for t, r in static_texts:
+            t.color = p[r]
+        theme_btn.data.value = "☀️ Light" if prefs["dark"] else "🌙 Dark"
+        refresh_nav()
+        render_choices()
+        render_history()
 
-    def toggle_theme(e):
-        state["dark"] = not state["dark"]
+    def toggle_theme():
+        prefs["dark"] = not prefs["dark"]
+        persist()
         apply_theme()
-        save_settings()
         page.update()
 
-    # ---------- header ----------
-    turbo_txt = ft.Text("", size=12, weight=ft.FontWeight.BOLD, color="#FFFFFF",
-                        text_align=ft.TextAlign.CENTER)
-    turbo_btn = ft.Container(content=turbo_txt, padding=8, border_radius=8, ink=True)
-
-    def refresh_turbo():
-        turbo_txt.value = f"⚡ Turbo 8x: {'ON' if state['turbo'] else 'OFF'}"
-        turbo_btn.bgcolor = "#15803D" if state["turbo"] else "#475569"
-
-    def toggle_turbo(e):
-        state["turbo"] = not state["turbo"]
-        refresh_turbo()
-        save_settings()
+    def set_tab(k):
+        st["tab"] = k
+        refresh_nav()
+        dl_body.visible = k == "download"
+        hist_body.visible = k == "history"
+        set_body.visible = k == "settings"
+        if k == "history":
+            render_history()
+        if k == "settings":
+            render_settings()
         page.update()
 
-    turbo_btn.on_click = toggle_turbo
-    refresh_turbo()
-
-    theme_txt = ft.Text("☀️ Light Mode", size=12, weight=ft.FontWeight.BOLD,
-                        color="#93C5FD", text_align=ft.TextAlign.CENTER)
-    theme_btn = ft.Container(content=theme_txt, bgcolor="#1E293B", padding=8,
-                             border_radius=8, ink=True, on_click=toggle_theme)
-
-    title_text = T("ULTRA DOWNLOADER PRO", "accent", 24, True)
-    sub_text = T("सभी क्वालिटी (4K / 1080p / 720p / 480p / 360p / Audio) + सटीक डेटा साइज (MB/GB)",
-                 "muted", 12)
-    ffmpeg_badge = T("✓ FFmpeg Active (4K/8K Lossless Merge Ready)" if has_ffmpeg
-                     else "⚡ Smart Direct Stream Mode (FFmpeg नहीं मिला)",
-                     size=11, bold=True, color=OK if has_ffmpeg else WARN)
-
-    # ---------- URL input ----------
-    url_input = ft.TextField(
-        label="वीडियो का लिंक यहाँ डालें (YouTube / Instagram / Facebook)",
-        hint_text="https://youtu.be/...", border_radius=12,
-        text_align=ft.TextAlign.CENTER,
-        on_submit=lambda e: fetch_video_info(), height=56,
-    )
-
-    # ---------- preview ----------
-    preview_col = ft.Column(controls=[], spacing=6,
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-    preview_card = box(preview_col, "panel", 12, 12)
-    preview_card.visible = False
-
-    # ---------- quality list ----------
-    banner = T("चुनी गई क्वालिटी: ⚡ Auto Best Quality", size=13, bold=True, color=OK)
-    quality_col = ft.Column(controls=[], spacing=6,
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-
-    def load_default_qualities():
-        items, fmt_map, extra = default_quality_items(has_ffmpeg)
-        state.update(items=items, fmt_map=fmt_map, extra=extra, selected="auto_best")
-
-    def select_quality(key):
-        state["selected"] = key
-        it = next((i for i in state["items"] if i["key"] == key), None)
-        if it:
-            banner.value = f"✓ चुनी गई क्वालिटी: {it['title']}  [ 📦 {it['size']} ]"
-        render_quality_list()
+    def set_pref(k, v):
+        prefs[k] = v
+        persist()
+        if st["meta"]:
+            st["choices"], st["blocked"] = build_choices(st["meta_raw"], ff.ok, prefs)
+            ensure_selection()
+        render_choices()
+        render_settings()
         page.update()
 
-    def render_quality_list():
-        quality_col.controls.clear()
-        w = panel_w()
-        compact = w < 380
-        badge_w = 118
-        title_w = w - 20 - (0 if compact else badge_w + 8)
-        for it in state["items"]:
-            sel = it["key"] == state["selected"]
-            bg = "#1D4ED8" if sel else (pal()["item"])
-            fg = "#FFFFFF" if sel else pal()["text"]
-            title = ft.Container(
-                content=ft.Text(f"{'🔘' if sel else '⚪'}  {it['title']}", size=13,
-                                weight=ft.FontWeight.BOLD, color=fg,
-                                text_align=ft.TextAlign.CENTER),
-                width=title_w, alignment=ft.Alignment(0, 0))
-            badge = ft.Container(
-                content=ft.Text(f"📦 {it['size']}", size=11, weight=ft.FontWeight.BOLD,
-                                color="#FFFFFF", text_align=ft.TextAlign.CENTER),
-                bgcolor="#15803D" if sel else "#334155", border_radius=6, padding=6,
-                width=(title_w if compact else badge_w), alignment=ft.Alignment(0, 0))
-            inner = (ft.Column([title, badge], spacing=4,
-                               horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-                     if compact else
-                     ft.Row([title, badge], spacing=8,
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER))
-            quality_col.controls.append(ft.Container(
-                content=inner, bgcolor=bg, padding=10, border_radius=10, width=w, ink=True,
-                on_click=lambda e, k=it["key"]: select_quality(k)))
+    def ensure_selection():
+        keys = [c.key for c in st["choices"] if c.available]
+        if st["selected"] not in keys:
+            st["selected"] = keys[0] if keys else ""
 
-    quality_box = box(ft.Column([
-        T("🎞️ 1. वीडियो क्वालिटी और डेटा साइज चुनें (क्लिक करें):", "accent", 14, True),
-        banner, quality_col],
-        spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
+    def pick_choice(k):
+        st["selected"] = k
+        render_choices()
+        page.update()
 
-    load_default_qualities()
+    def toggle_path():
+        path_field.value = prefs["save_dir"]
+        path_field.visible = not path_field.visible
+        page.update()
 
-    # ---------- save folder ----------
-    path_label = T(f"📁 वर्तमान सेव फोल्डर: {state['save_dir']}", size=12, color="#93C5FD")
-    custom_path_input = ft.TextField(
-        label="कस्टम सेव फोल्डर पाथ", value=state["save_dir"],
-        text_align=ft.TextAlign.CENTER, border_radius=10, visible=False)
-
-    def apply_folder_path(new_path):
-        new_path = (new_path or "").strip()
-        if not new_path:
+    def apply_path(p):
+        p = (p or "").strip()
+        if not p:
             return
         try:
-            os.makedirs(new_path, exist_ok=True)
-            probe = os.path.join(new_path, ".write_test")
+            os.makedirs(p, exist_ok=True)
+            probe = os.path.join(p, ".ultra_write_test")
             with open(probe, "w") as fh:
                 fh.write("ok")
             os.remove(probe)
         except Exception as ex:
-            tell(f"❌ यह फोल्डर उपयोग नहीं हो सकता: {str(ex)[:70]}", ERR)
+            say(f"❌ यह फोल्डर लिखने योग्य नहीं: {str(ex)[:80]}", ERR)
+            if IS_ANDROID:
+                say("❌ Android पर public फोल्डर के लिए अनुमति चाहिए। "
+                    "ऐप-निजी फोल्डर आज़माएँ (नीचे प्रीसेट)।", ERR)
+            page.update()
             return
-        state["save_dir"] = new_path
-        path_label.value = f"📁 वर्तमान सेव फोल्डर: {new_path}"
-        custom_path_input.value = new_path
-        custom_path_input.visible = False
-        save_path_btn.visible = False
-        save_settings()
-        tell(f"✅ सेव फोल्डर अपडेट हो गया: {new_path}", OK)
-
-    def toggle_manual_path(e=None):
-        custom_path_input.value = state["save_dir"]
-        custom_path_input.visible = not custom_path_input.visible
-        save_path_btn.visible = custom_path_input.visible
+        prefs["save_dir"] = p
+        persist()
+        path_field.visible = False
+        folder_t.value = f"📁 {p}"
+        say(f"✅ सेव फोल्डर सेट: {p}", OK)
+        render_settings()
         page.update()
 
-    def tk_browse():
-        def _run():
-            try:
-                import tkinter as tk
-                from tkinter import filedialog
-                root = tk.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                chosen = filedialog.askdirectory(initialdir=state["save_dir"])
-                root.destroy()
-                if chosen:
-                    apply_folder_path(chosen)
-                return
-            except Exception:
-                pass
-            if not custom_path_input.visible:
-                toggle_manual_path()
-        threading.Thread(target=_run, daemon=True).start()
+    def preset(android_sub, desktop_sub):
+        if IS_ANDROID:
+            appdir = os.environ.get("FLET_APP_STORAGE_DATA")
+            p = (os.path.join(appdir, android_sub) if appdir
+                 else f"/storage/emulated/0/{android_sub}/UltraVideos")
+        else:
+            p = os.path.join(os.path.expanduser("~"), desktop_sub, "UltraVideos")
+        apply_path(p)
 
-    def browse_click(e=None):
-        init = state["save_dir"] if os.path.isdir(state["save_dir"]) else None
+    def open_folder(p):
         try:
-            if inspect.iscoroutinefunction(ft.FilePicker.get_directory_path):   # Flet 1.x
-                async def _go():
+            os.makedirs(p, exist_ok=True)
+            if IS_WIN:
+                os.startfile(p)
+            elif IS_MAC:
+                subprocess.Popen(["open", p])
+            elif not IS_ANDROID:
+                subprocess.Popen(["xdg-open", p])
+            else:
+                toast(f"📁 {p}")
+        except Exception:
+            toast(f"📁 {p}")
+
+    def open_folder_of(path):
+        open_folder(os.path.dirname(path) if path else prefs["save_dir"])
+
+    def browse():
+        init = prefs["save_dir"] if os.path.isdir(prefs["save_dir"]) else None
+        try:
+            if hasattr(ft.FilePicker, "get_directory_path") and \
+                    asyncio.iscoroutinefunction(ft.FilePicker.get_directory_path):
+                async def go():
                     try:
                         p = await ft.FilePicker().get_directory_path(
-                            dialog_title="वीडियो सेव फोल्डर चुनें", initial_directory=init)
+                            dialog_title="सेव फोल्डर चुनें", initial_directory=init)
+                        if p:
+                            apply_path(p)
                     except Exception:
-                        tk_browse()
-                        return
-                    if p:
-                        apply_folder_path(p)
-                page.run_task(_go)
-            else:                                                                # Flet 0.2x
-                fp = ft.FilePicker(on_result=lambda r: apply_folder_path(getattr(r, "path", None)))
+                        toggle_path()
+                page.run_task(go)
+            else:
+                fp = ft.FilePicker(on_result=lambda r: apply_path(getattr(r, "path", None)))
                 page.overlay.append(fp)
                 page.update()
-                fp.get_directory_path(dialog_title="वीडियो सेव फोल्डर चुनें", initial_directory=init)
+                fp.get_directory_path(dialog_title="सेव फोल्डर चुनें",
+                                      initial_directory=init)
         except Exception:
-            tk_browse()
+            toggle_path()
 
-    def open_saved_folder(e=None):
-        target = state["save_dir"]
-        try:
-            os.makedirs(target, exist_ok=True)
-            if sys.platform == "win32":
-                os.startfile(target)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", target])
-            elif not is_android:
-                subprocess.Popen(["xdg-open", target])
-            else:
-                tell(f"📁 फाइलें यहाँ हैं: {target}", INFO)
-        except Exception:
-            tell(f"📁 फोल्डर पाथ: {target}", INFO)
-
-    def preset(android_path, *desktop_parts):
-        return lambda e: apply_folder_path(
-            android_path if is_android else os.path.join(os.path.expanduser("~"), *desktop_parts))
-
-    save_path_btn = btn("✓ नया फोल्डर पाथ सेव करें", "#15803D",
-                        lambda e: apply_folder_path(custom_path_input.value))
-    save_path_btn.visible = False
-
-    folder_main = reg_group([
-        btn("📁 Browse Folder", "#1D4ED8", browse_click, 38),
-        btn("✏️ Edit Path", "#334155", toggle_manual_path, 38),
-        btn("📂 Open Folder", "#0F766E", open_saved_folder, 38),
-    ], 3, 120, panel_w)
-    folder_presets = reg_group([
-        btn("📥 Downloads", "#0F172A", preset("/storage/emulated/0/Download/UltraVideos",
-                                              "Downloads", "UltraVideos"), 34),
-        btn("🎬 Movies", "#0F172A", preset("/storage/emulated/0/Movies/UltraVideos",
-                                           "Videos", "UltraVideos"), 34),
-        btn("🎵 Music", "#0F172A", preset("/storage/emulated/0/Music/UltraAudio",
-                                          "Music", "UltraAudio"), 34),
-    ], 3, 100, panel_w)
-
-    folder_box = box(ft.Column([
-        T("📂 2. फाइल सेव फोल्डर (Phone, Tablet & PC):", "accent", 14, True),
-        path_label, folder_main, folder_presets, custom_path_input, save_path_btn],
-        spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
-
-    # ---------- options ----------
-    def make_toggle(label, key):
-        t = ft.Text("", size=12, weight=ft.FontWeight.BOLD, color="#FFFFFF",
-                    text_align=ft.TextAlign.CENTER)
-        c = ft.Container(content=t, height=40, padding=6, border_radius=10, ink=True,
-                         alignment=ft.Alignment(0, 0))
-
-        def refresh():
-            t.value = f"{'✅' if state[key] else '⬜'} {label}"
-            c.bgcolor = "#15803D" if state[key] else "#475569"
-
-        def click(e):
-            state[key] = not state[key]
-            refresh()
-            save_settings()
-            page.update()
-
-        c.on_click = click
-        refresh()
-        return c
-
-    options_row = reg_group([
-        make_toggle("Cancel पर अधूरी फाइल हटाएं", "delete_partial"),
-        make_toggle("पूरा होने पर फोल्डर खोलें", "open_after"),
-    ], 2, 200, panel_w)
-    options_box = box(ft.Column([T("⚙️ 3. एक्स्ट्रा सेटिंग्स:", "accent", 14, True), options_row],
-                                spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
-
-    # ---------- status ----------
-    progress_bar = ft.ProgressBar(value=0, visible=False)
-    percent_txt = T("", "accent", 28, True)
-    status_label = T("✅ ऐप तैयार है! लिंक डालकर 'Scan' या 'Download' दबाएं।",
-                     size=14, bold=True, color=OK)
-    stats_label = T("डेटा: --  |  स्पीड: --  |  बचा समय: --", "muted", 12)
-    status_box = box(ft.Column([progress_bar, percent_txt, status_label, stats_label],
-                               spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
-    history_col = ft.Column(controls=[], spacing=6,
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-
-    # ---------- scan ----------
-    def fetch_video_info(e=None):
-        if state["scanning"]:
-            return
-        url = (url_input.value or "").strip()
-        if not looks_like_url(url):
-            tell("⚠️ कृपया सही लिंक डालें (http:// या https:// से शुरू)।", ERR)
-            return
-        state["scanning"] = True
-        tell("🔍 क्वालिटी और सटीक डेटा साइज स्कैन हो रहे हैं...", INFO)
-        progress_bar.visible = True
-        progress_bar.value = None
+    def retest_ff():
+        nonlocal ff
+        ff = discover_ffmpeg(ff_field.value.strip() or prefs.get("ff_custom", ""))
+        refresh_ff()
+        if st.get("meta_raw"):
+            st["choices"], st["blocked"] = build_choices(st["meta_raw"], ff.ok, prefs)
+            ensure_selection()
+        render_choices()
+        render_settings()
+        say(("✅ FFmpeg मिल गया: " + ff.version) if ff.ok else
+            "⚠ FFmpeg नहीं मिला — HD मर्ज उपलब्ध नहीं।", OK if ff.ok else WARN)
         page.update()
 
-        def _fetch():
-            try:
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True,
-                                       "noplaylist": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                items, fmt_map, extra = build_quality_items(info, has_ffmpeg)
-                if items:
-                    state.update(items=items, fmt_map=fmt_map, extra=extra, selected="auto_best")
-                    banner.value = (f"✓ चुनी गई क्वालिटी: {items[0]['title']}  "
-                                    f"[ 📦 {items[0]['size']} ]")
-                    render_quality_list()
+    def apply_ff_path():
+        prefs["ff_custom"] = ff_field.value.strip()
+        persist()
+        retest_ff()
 
-                preview_col.controls.clear()
-                thumb = info.get("thumbnail")
-                if thumb and str(thumb).startswith("http"):
-                    try:
-                        tw = min(panel_w() - 24, 320)
-                        kw = dict(src=thumb, width=tw, height=int(tw * 9 / 16), border_radius=10)
-                        fit = img_fit()
-                        if fit is not None:
-                            kw["fit"] = fit
-                        preview_col.controls.append(ft.Image(**kw))
-                    except Exception:
-                        pass
-                preview_col.controls.append(T(f"🎬 {info.get('title', 'Video')}", "accent", 14, True))
-                preview_col.controls.append(T(
-                    f"चैनल: {info.get('uploader') or '—'}  •  अवधि: "
-                    f"{format_duration(info.get('duration'))}  •  {len(items)} विकल्प", "muted", 12))
-                preview_card.visible = True
-                tell("✅ सभी क्वालिटी और डेटा साइज लोड हो गए! नीचे लिस्ट से चुनें।", OK)
-            except Exception as ex:
-                tell(f"❌ स्कैन एरर: {friendly_error(ex)}", ERR)
-            finally:
-                state["scanning"] = False
-                progress_bar.visible = False
-                progress_bar.value = 0
+    def apply_cookies():
+        prefs["cookies"] = cookie_field.value.strip()
+        persist()
+        say("✅ cookies पाथ सेव हुआ।", OK)
+        page.update()
+
+    def do_clear():
+        if engine.busy:
+            say("⏳ पहले डाउनलोड रोकें, फिर Clear करें।", WARN)
+            page.update()
+            return
+        url_field.value = ""
+        st.update(meta={}, choices=[], blocked=[], selected="auto", p=None,
+                  done=0, total=0, speed="--", eta="--", last_warn="")
+        st["meta_raw"] = None
+        preview_card.visible = False
+        warn_card.visible = False
+        quality_col.controls.clear()
+        sel_t.value = "कोई विकल्प नहीं"
+        say("✅ साफ़ — नया लिंक डालें।", OK)
+        page.update()
+
+    def do_paste():
+        def use(txt):
+            t = normalize_url(txt)
+            if t:
+                url_field.value = t
                 page.update()
-
-        threading.Thread(target=_fetch, daemon=True).start()
-
-    # ---------- download engine ----------
-    def cleanup_partial():
-        """Delete ONLY partial leftovers (.part / .ytdl / -Frag*), never finished files."""
-        removed = 0
-        for f in list(state["touched"]):
-            base = f[:-5] if f.endswith(".part") else f
-            cands = {base + ".part", base + ".ytdl"}
-            cands.update(glob.glob(glob.escape(base) + "*Frag*"))
-            for m in cands:
-                if os.path.isfile(m):
+                do_scan()
+        try:
+            if hasattr(ft, "Clipboard"):
+                async def go():
                     try:
-                        os.remove(m)
-                        removed += 1
+                        use(await ft.Clipboard().get())
                     except Exception:
-                        pass
-        state["touched"].clear()
-        return removed
-
-    def progress_hook(d):
-        if state["cancel"]:
-            raise DownloadCancelledError("Cancelled by user")
-        for k in ("filename", "tmpfilename"):
-            if d.get(k):
-                state["touched"].add(d[k])
-        now = time.time()
-        if d.get("status") == "downloading":
-            if now - state["last_ui"] < 0.15:
+                        say("ℹ️ बॉक्स में Ctrl+V / लंबा दबाकर Paste करें।", INFO)
+                        page.update()
+                page.run_task(go)
                 return
-            state["last_ui"] = now
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            done = d.get("downloaded_bytes", 0)
-            if total > 0:
-                progress_bar.value = min(1.0, done / total)
-                percent_txt.value = f"{done * 100 / total:.0f}%"
-            speed = clean_ansi(d.get("_speed_str", "--"))
-            eta = clean_ansi(d.get("_eta_str", "--"))
-            status_label.value = "⬇️ डाउनलोड हो रहा है..."
-            status_label.color = INFO
-            stats_label.value = (f"डेटा: {format_bytes(done, '--')} / {format_bytes(total, '--')}"
-                                 f"  |  स्पीड: {speed}  |  बचा समय: {eta}")
-            page.update()
-        elif d.get("status") == "finished":
-            progress_bar.value = 1.0
-            percent_txt.value = "100%"
-            status_label.value = "⚙️ फाइल को सुरक्षित सेव / मर्ज किया जा रहा है..."
-            status_label.color = WARN
-            page.update()
-
-    def pp_hook(d):
-        if state["cancel"] and d.get("status") == "started":
-            raise DownloadCancelledError("Cancelled by user")
-
-    def set_idle_buttons():
-        start_btn.data.value = "⬇️ Start / Resume Download"
-        start_btn.bgcolor = "#16A34A"
-        cancel_btn.bgcolor = "#7F1D1D"
-
-    def run_download(url, key):
-        try:
-            os.makedirs(state["save_dir"], exist_ok=True)
-        except Exception:
-            pass
-        fmt = state["fmt_map"].get(
-            key, "bestvideo+bestaudio/best" if has_ffmpeg else "best[ext=mp4]/best")
-        is_audio = key.startswith("audio") or key == "auto_audio"
-        name = "%(title).150B [audio]" if is_audio else "%(title).150B [%(height)sp]"
-        opts = {
-            "format": fmt,
-            "outtmpl": os.path.join(state["save_dir"], name + ".%(ext)s"),
-            "progress_hooks": [progress_hook],
-            "postprocessor_hooks": [pp_hook],
-            "noplaylist": True, "continuedl": True, "quiet": True, "no_warnings": True,
-            "retries": 10, "fragment_retries": 10,
-            "concurrent_fragment_downloads": 8 if state["turbo"] else 2,
-        }
-        if state["turbo"]:
-            opts["http_chunk_size"] = 10 * 1024 * 1024
-        if has_ffmpeg and "+" in fmt:
-            opts["merge_output_format"] = "mp4"
-        opts.update(state["extra"].get(key, {}))
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Video")
-            path = None
-            for rd in info.get("requested_downloads") or []:
-                path = rd.get("filepath") or path
-            size = os.path.getsize(path) if path and os.path.exists(path) else (
-                info.get("filesize") or info.get("filesize_approx") or 0)
-            q = "Audio" if is_audio else (f"{info.get('height')}p" if info.get("height") else "Video")
-            tell(f"🎉 डाउनलोड पूरा हुआ: {title}", OK)
-            stats_label.value = f"सेव लोकेशन: {state['save_dir']}"
-            percent_txt.value = "✅"
-            history_col.controls.insert(0, ft.Container(
-                content=T(f"✓ {title}  [{q} • {format_bytes(size, '—')}]", size=12, bold=True,
-                          color="#86EFAC"),
-                padding=10, border_radius=8, bgcolor="#14532D", width=panel_w()))
-            state["touched"].clear()
-            toast("✅ डाउनलोड पूरा हुआ!")
-            if state["open_after"]:
-                open_saved_folder()
-        except DownloadCancelledError:
-            _on_cancelled()
-        except Exception as ex:
-            if state["cancel"] or "Cancelled" in str(ex):
-                _on_cancelled()
-            else:
-                tell(f"❌ डाउनलोड त्रुटि: {friendly_error(ex)}", ERR)
-        finally:
-            state["downloading"] = False
-            state["cancel"] = False
-            progress_bar.visible = False
-            set_idle_buttons()
-            page.update()
-
-    def _on_cancelled():
-        progress_bar.value = 0
-        percent_txt.value = ""
-        stats_label.value = "डेटा: --  |  स्पीड: Cancelled  |  बचा समय: --"
-        if state["delete_partial"]:
-            n = cleanup_partial()
-            tell(f"🛑 डाउनलोड Cancel हुआ। अधूरी फाइलें हटाई गईं ({n}).", WARN)
-        else:
-            tell("🛑 डाउनलोड Cancel हुआ। दोबारा Start दबाने पर वहीं से Resume होगा।", WARN)
-
-    def start_click(e=None):
-        if state["downloading"]:
-            tell("⏳ एक डाउनलोड पहले से चल रहा है!", WARN)
-            return
-        url = (url_input.value or "").strip()
-        if not looks_like_url(url):
-            tell("⚠️ कृपया सही वीडियो लिंक डालें (http:// या https://)।", ERR)
-            return
-        state.update(downloading=True, cancel=False)
-        state["touched"].clear()
-        progress_bar.visible = True
-        progress_bar.value = 0
-        percent_txt.value = "0%"
-        start_btn.data.value = "⏳ डाउनलोड जारी है..."
-        start_btn.bgcolor = "#475569"
-        cancel_btn.bgcolor = "#DC2626"
-        tell("🚀 डाउनलोड शुरू हो रहा है...", INFO)
-        threading.Thread(target=run_download, args=(url, state["selected"]), daemon=True).start()
-
-    def cancel_click(e=None):
-        if state["downloading"]:
-            state["cancel"] = True
-            tell("🛑 डाउनलोड रोका जा रहा है, कृपया प्रतीक्षा करें...", WARN)
-        else:
-            tell("ℹ️ अभी कोई डाउनलोड नहीं चल रहा है।", "#94A3B8")
-
-    def apply_pasted(text):
-        text = (text or "").strip()
-        if text:
-            url_input.value = text
-            page.update()
-            fetch_video_info()
-
-    def paste_click(e=None):
-        try:
-            if hasattr(ft, "Clipboard"):                      # Flet 1.x
-                async def _go():
-                    try:
-                        apply_pasted(await ft.Clipboard().get())
-                    except Exception:
-                        tell("ℹ️ बॉक्स में Ctrl+V / लंबा दबाकर Paste करें।", INFO)
-                page.run_task(_go)
-                return
-            if hasattr(page, "get_clipboard"):                # Flet 0.2x
-                apply_pasted(page.get_clipboard())
+            if hasattr(page, "get_clipboard"):
+                use(page.get_clipboard())
                 return
             raise RuntimeError
         except Exception:
-            try:
-                import tkinter as tk
-                r = tk.Tk()
-                r.withdraw()
-                clip = r.clipboard_get()
-                r.destroy()
-                apply_pasted(clip)
-            except Exception:
-                tell("ℹ️ बॉक्स में Ctrl+V / लंबा दबाकर Paste करें।", INFO)
+            say("ℹ️ बॉक्स में Ctrl+V / लंबा दबाकर Paste करें।", INFO)
+            page.update()
 
-    def clear_click(e=None):
-        if state["downloading"]:
-            tell("⏳ पहले डाउनलोड Cancel करें, फिर Clear करें।", WARN)
+    def do_scan():
+        if st["scanning"]:
             return
-        url_input.value = ""
-        preview_card.visible = False
-        progress_bar.visible = False
-        progress_bar.value = 0
-        percent_txt.value = ""
-        load_default_qualities()
-        banner.value = "चुनी गई क्वालिटी: ⚡ Auto Best Quality"
-        render_quality_list()
-        tell("✅ साफ कर दिया गया! नया लिंक डालें।", OK)
-        stats_label.value = "डेटा: --  |  स्पीड: --  |  बचा समय: --"
+        url = normalize_url(url_field.value)
+        url_field.value = url
+        if not is_url(url):
+            say("⚠️ सही लिंक डालें (http/https या youtu.be/…)।", ERR)
+            page.update()
+            return
+        st["scanning"] = True
+        say("🔍 क्वालिटी + साइज़ स्कैन हो रहे हैं…", INFO)
+        st["p"] = None
         page.update()
 
-    def clear_history(e=None):
-        history_col.controls.clear()
+        def work():
+            try:
+                o = {"quiet": True, "noplaylist": True, "skip_download": True,
+                     "logger": YdlLog(lambda l, m: None)}
+                if ff.ok:
+                    o["ffmpeg_location"] = ff.folder
+                if prefs.get("cookies") and os.path.isfile(prefs["cookies"]):
+                    o["cookiefile"] = prefs["cookies"]
+                with yt_dlp.YoutubeDL(o) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                chs, blocked = build_choices(info, ff.ok, prefs)
+                st["meta_raw"] = info
+                st["meta"] = {"title": info.get("title"), "thumbnail": info.get("thumbnail"),
+                              "uploader": info.get("uploader"), "duration": info.get("duration"),
+                              "extractor": info.get("extractor_key", "")}
+                st["choices"], st["blocked"] = chs, blocked
+                st["selected"] = "auto" if any(c.key == "auto" for c in chs) else \
+                    next((c.key for c in chs if c.available), "")
+                say(f"✅ {len([c for c in chs if c.available])} विकल्प मिले। "
+                    "हर वीडियो विकल्प में आवाज़ शामिल है।", OK)
+            except Exception as ex:
+                say("❌ स्कैन: " + friendly_error(ex), ERR)
+            finally:
+                st["scanning"] = False
+                st["p"] = 0
+                st["rev"] += 1
+        threading.Thread(target=work, daemon=True).start()
+
+    def do_start():
+        url = normalize_url(url_field.value)
+        if not is_url(url):
+            say("⚠️ सही लिंक डालें।", ERR)
+            page.update()
+            return
+        ch = next((c for c in st["choices"] if c.key == st["selected"] and c.available), None)
+        if ch is None:
+            say("⚠️ पहले Scan करें और उपलब्ध क्वालिटी चुनें।", ERR)
+            page.update()
+            return
+        if ch.needs_ffmpeg and not ff.ok:
+            say("❌ यह विकल्प FFmpeg माँगता है — सेटिंग्स में FFmpeg जोड़ें।", ERR)
+            page.update()
+            return
+        engine.submit({"url": url, "choice": ch, "prefs": dict(prefs),
+                       "save_dir": prefs["save_dir"], "ff": ff,
+                       "title": st["meta"].get("title", "Video")})
+        say("🚀 कतार में जोड़ा गया…", INFO)
         page.update()
 
-    # ---------- main action buttons ----------
-    scan_group = reg_group([
-        btn("📋 Paste & Scan", "#334155", paste_click),
-        btn("🔍 Scan Quality & Size", "#2563EB", fetch_video_info),
-        btn("✖ Clear", "#475569", clear_click),
-    ], 3, 150)
+    def do_cancel():
+        if engine.busy or st["queue"]:
+            engine.cancel()
+            engine.drop_queue()
+            say("🛑 रोक रहा है, प्रतीक्षा करें…", WARN)
+        else:
+            say("ℹ️ अभी कोई डाउनलोड नहीं चल रहा।", INFO)
+        page.update()
 
-    start_btn = btn("⬇️ Start / Resume Download", "#16A34A", start_click, 52, 14)
-    cancel_btn = btn("🛑 Cancel (रोकें)", "#7F1D1D", cancel_click, 52, 14)
-    action_group = reg_group([start_btn, cancel_btn], 2, 200, spacing=10)
+    def del_hist(i):
+        try:
+            st["hist"].pop(i)
+            save_json(HIST, st["hist"])
+            render_history()
+            page.update()
+        except Exception:
+            pass
 
-    history_title = T("📜 हाल के डाउनलोड (History)", "muted", 13, True)
-    clear_hist_btn = btn("🗑 History साफ करें", "#334155", clear_history, 34, 11)
-    history_group = reg_group([clear_hist_btn], 1, 160)
+    def do_repair(i):
+        try:
+            engine.repair(st["hist"][i], ff, dict(prefs))
+            say("🔧 आवाज़ जोड़ी जा रही है…", WARN)
+            page.update()
+        except Exception as ex:
+            say("❌ " + friendly_error(ex), ERR)
 
-    footer = T("Ultra Downloader Pro • सिर्फ़ उन्हीं वीडियो को डाउनलोड करें जिनका आपको अधिकार है।",
-               "muted", 10)
+    def cleanup_partial(path):
+        if not path:
+            return 0
+        base = path[:-5] if path.endswith(".part") else path
+        cands = {base + ".part", base + ".ytdl"}
+        cands |= set(glob.glob(glob.escape(base) + "*Frag*"))
+        n = 0
+        for f in cands:
+            if os.path.isfile(f):
+                try:
+                    os.remove(f)
+                    n += 1
+                except Exception:
+                    pass
+        return n
 
-    main_card = ft.Container(
-        width=state["card_w"], padding=16, border_radius=18, bgcolor=pal()["card"],
+    # ---------- engine events ----------
+    def on_event(ev):
+        t = ev.get("type")
+        if t == "progress":
+            st["p"], st["done"], st["total"] = ev["p"], ev["done"], ev["total"]
+            st["speed"], st["eta"] = ev["speed"], ev["eta"]
+            st["cur_file"] = ev.get("file", "")
+            st["phase"] = "download"
+        elif t == "phase":
+            st["phase"] = ev["phase"]
+            if ev.get("file"):
+                st["cur_file"] = ev["file"]
+            say({"download": "⬇️ डाउनलोड हो रहा है…",
+                 "merge": "⚙️ मर्ज/कन्वर्ट हो रहा है (आवाज़ जोड़ी जा रही है)…",
+                 "repair": "🔧 आवाज़ की मरम्मत हो रही है…"}.get(ev["phase"], "…"),
+                INFO if ev["phase"] == "download" else WARN)
+        elif t == "log":
+            if ev["lvl"] in ("warning", "error"):
+                m = ev["msg"]
+                if any(k in m.lower() for k in ("merg", "ffmpeg")):
+                    st["last_warn"] = m[:160]
+                    st["rev"] += 1
+        elif t == "queue":
+            st["queue"] = ev["n"]
+        elif t == "done":
+            e = ev["entry"]
+            st["hist"].insert(0, e)
+            st["hist"] = st["hist"][:200]
+            save_json(HIST, st["hist"])
+            st["phase"] = "done"
+            st["p"] = 1.0
+            if e["kind"] == "audio":
+                say(f"🎉 ऑडियो सेव हुआ: {e['title'][:60]}", OK)
+            elif e["audio"] is True:
+                say(f"🎉 पूरा हुआ • 🔊 आवाज़ सत्यापित: {e['title'][:60]}", OK)
+            elif e["audio"] is False:
+                say(f"⚠️ फाइल बनी पर 🔇 आवाज़ नहीं मिली! इतिहास में 'आवाज़ ठीक करें' दबाएँ।", ERR)
+            else:
+                say(f"✅ पूरा हुआ (सत्यापन संभव नहीं): {e['title'][:60]}", WARN)
+            st["rev"] += 1
+            if prefs["open_after"]:
+                open_folder_of(e.get("path"))
+        elif t == "cancelled":
+            st["phase"] = "cancelled"
+            st["p"] = 0
+            if prefs["delete_partial"]:
+                n = cleanup_partial(st.get("cur_file", ""))
+                say(f"🛑 रोका गया • अधूरी फाइलें हटाईं ({n})।", WARN)
+            else:
+                say("🛑 रोका गया • दोबारा Start दबाने पर Resume होगा।", WARN)
+        elif t == "error":
+            st["phase"] = "error"
+            say("❌ " + ev["msg"], ERR)
+        elif t == "idle":
+            if st["phase"] not in ("error", "cancelled"):
+                st["phase"] = "idle"
+            st["rev"] += 1
+
+    engine = Downloader(on_event)
+
+    # ---------- bodies ----------
+    scan_row = grp([
+        button("📋 Paste & Scan", "#334155", lambda e: do_paste()),
+        button("🔍 Scan", "#2563EB", lambda e: do_scan()),
+        button("✖ Clear", "#475569", lambda e: do_clear()),
+    ], 3, 140)
+
+    start_btn = button("⬇️ डाउनलोड शुरू / Resume", "#16A34A", lambda e: do_start(), 52, 14)
+    cancel_btn = button("🛑 रोकें", "#7F1D1D", lambda e: do_cancel(), 52, 14)
+    action_row = grp([start_btn, cancel_btn], 2, 190, 10)
+
+    dl_body = ft.Column(controls=[
+        url_field, scan_row, preview_card, warn_card,
+        panel(ft.Column([T("🎞️ क्वालिटी चुनें (टैप करें)", "accent", 14, True,
+                           reg=True, align=ft.TextAlign.CENTER),
+                         sel_t, quality_col], spacing=8,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER), reg=True),
+        panel(ft.Column([folder_t,
+                         button("📂 फोल्डर बदलें", "#334155",
+                                lambda e: set_tab("settings"), 34, 11)],
+                        spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+              reg=True),
+        action_row,
+        panel(ft.Column([progress_bar, pct_t, status_t, stats_t, queue_t], spacing=6,
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER), reg=True),
+    ], spacing=11, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    hist_body = ft.Column(controls=[
+        T("📜 हाल के डाउनलोड (सुरक्षित इतिहास)", "accent", 14, True, reg=True,
+          align=ft.TextAlign.CENTER),
+        button("🗑 पूरा इतिहास साफ़ करें", "#334155",
+               lambda e: (st["hist"].clear(), save_json(HIST, []),
+                          render_history(), page.update()), 36, 11),
+        hist_col,
+    ], spacing=10, visible=False, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    set_body = ft.Column(controls=[set_col], spacing=10, visible=False,
+                         horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    root = ft.Container(
+        width=st["card_w"], padding=14, border_radius=18, bgcolor=pal()["card"],
         content=ft.Column(controls=[
-            ft.Row([turbo_btn, theme_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            title_text, sub_text, ffmpeg_badge,
-            url_input, scan_group, preview_card,
-            action_group, status_box,
-            quality_box, folder_box, options_box,
-            history_title, history_col, history_group, footer,
-        ], spacing=12, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-    )
+            ft.Row([ff_chip, theme_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            title_t, sub_t, nav_row, dl_body, hist_body, set_body,
+        ], spacing=11, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
 
-    # ---------- responsive resize ----------
+    # ---------- UI pump: सारा UI केवल यहीं बदलता है / all UI writes here ----------
+    def paint():
+        busy = engine.busy or st["scanning"]
+        progress_bar.visible = bool(busy or st["phase"] in ("download", "merge", "repair"))
+        if st["scanning"] or (busy and st["p"] is None):
+            progress_bar.value = None
+            pct_t.value = "…"
+        else:
+            p = st["p"] or 0
+            progress_bar.value = p
+            pct_t.value = ("✅" if st["phase"] == "done" else f"{p*100:.0f}%")
+        status_t.value, status_t.color = st["status"], st["scol"]
+        stats_t.value = (f"डेटा: {human_size(st['done'],'--')} / "
+                         f"{human_size(st['total'],'--')}  •  स्पीड: {st['speed']}"
+                         f"  •  बचा समय: {st['eta']}")
+        queue_t.value = (f"कतार में {st['queue']} और बाकी" if st["queue"] else "")
+        folder_t.value = f"📁 {prefs['save_dir']}"
+        start_btn.data.value = ("⏳ डाउनलोड जारी…" if engine.busy
+                                else "⬇️ डाउनलोड शुरू / Resume")
+        start_btn.bgcolor = "#475569" if engine.busy else "#16A34A"
+        cancel_btn.bgcolor = "#DC2626" if engine.busy else "#7F1D1D"
+
+    last_rev = [-1]
+
+    def tick():
+        if st["rev"] != last_rev[0]:
+            last_rev[0] = st["rev"]
+            render_preview()
+            render_choices()
+            if st["tab"] == "history":
+                render_history()
+            layout()
+        paint()
+        try:
+            page.update()
+        except Exception:
+            pass
+
+    async def pump():
+        while not stop.is_set():
+            try:
+                tick()
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+
     def fit(e=None):
         try:
             w = float(getattr(page, "width", None) or 0)
         except Exception:
             w = 0
         if w <= 0:
-            w = 560
-        new_w = int(max(300, min(600, w - 24)))
-        if abs(new_w - state["card_w"]) < 6 and e is not None:
+            w = 580
+        nw = int(max(300, min(660, w - 22)))
+        if abs(nw - st["card_w"]) < 6 and e is not None:
             return
-        state["card_w"] = new_w
-        main_card.width = new_w
-        layout_groups()
-        render_quality_list()
-        for c in history_col.controls:
-            c.width = panel_w()
-        page.update()
+        st["card_w"] = nw
+        root.width = nw
+        layout()
+        st["rev"] += 1
 
     for hook in ("on_resize", "on_resized"):
         try:
             setattr(page, hook, fit)
         except Exception:
             pass
+    for hook in ("on_disconnect", "on_close"):
+        try:
+            setattr(page, hook, lambda e: stop.set())
+        except Exception:
+            pass
 
-    set_idle_buttons()
     apply_theme()
-    layout_groups()
+    refresh_nav()
+    render_settings()
+    render_history()
+    layout()
     try:
-        body = ft.SafeArea(content=ft.Row([main_card], alignment=ft.MainAxisAlignment.CENTER))
+        body = ft.SafeArea(content=ft.Row([root], alignment=ft.MainAxisAlignment.CENTER))
     except Exception:
-        body = ft.Row([main_card], alignment=ft.MainAxisAlignment.CENTER)
+        body = ft.Row([root], alignment=ft.MainAxisAlignment.CENTER)
     page.add(body)
     fit()
-    page.update()
+    tick()
+
+    if hasattr(page, "run_task"):
+        page.run_task(pump)
+    else:
+        def loop():
+            while not stop.is_set():
+                tick()
+                time.sleep(0.2)
+        threading.Thread(target=loop, daemon=True).start()
 
 
+# =====================================================================
 if __name__ == "__main__":
-    print("🚀 Starting Ultra Video Downloader Pro...")
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    print(f"🚀 {APP_NAME} {APP_VER}")
     try:
         if hasattr(ft, "run"):
             ft.run(main)
         else:
             ft.app(target=main)
     except Exception as err:
-        print("Fatal Error:", err)
+        print("Fatal:", err)
         traceback.print_exc()
