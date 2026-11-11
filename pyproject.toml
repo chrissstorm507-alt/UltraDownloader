@@ -1,0 +1,18 @@
+[project]
+name = "ultradownloader"
+version = "1.0.0"
+description = "Ultra Quality Video Downloader"
+dependencies = [
+    "flet",
+    "yt-dlp"
+]
+
+[tool.flet]
+org = "com.baba.ultradownloader"
+product = "Ultra Video Downloader"
+company = "UltraTech"
+
+[tool.flet.android.permission]
+"android.permission.INTERNET" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
+"android.permission.READ_EXTERNAL_STORAGE" = true
